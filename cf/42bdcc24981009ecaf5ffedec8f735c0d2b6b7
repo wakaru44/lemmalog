@@ -1,0 +1,19 @@
+src/bin/lemmalog-cli.rs
+  s_85b9db8fa6ae58::t_b4a70cb41b20a0 35-61,63,69-71,97,99-101
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "cf42bdcc24981009ecaf5ffedec8f735c0d2b6b7",
+  "prompts": {},
+  "sessions": {
+    "s_85b9db8fa6ae58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "232fde05-f651-46d7-87dc-7e977108c37e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Wakaru Himura <wakaru44@gmail.com>"
+    }
+  }
+}
