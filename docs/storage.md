@@ -166,7 +166,7 @@ sqlite3 -header -column memory.db \
 ```
 subject             predicate  object   valid_to    retract_reason
 ------------------  ---------  -------  ----------  --------------
-job:invoice_export  status     running  1789902683  superseded
+job:invoice_export  status     running  1789904269  superseded
 ```
 
 The row stays. That is the point: "true until when, and why not now" is
@@ -205,8 +205,8 @@ sqlite3 -header -column memory.db \
 ```
 predicate  object   valid_to             prov
 ---------  -------  -------------------  ----------
-status     running  1789902683           ep1
-status     running  1789902683           superseded
+status     running  1789904269           ep1
+status     running  1789904269           superseded
 status     failed   9223372036854775807  ep2
 ```
 
@@ -221,10 +221,10 @@ sqlite3 -header -column memory.db \
 ```
 id   ts          text
 ---  ----------  -------------------------------------
-ep1  1789902683  svc:billing --owns--> table:invoices
+ep1  1789904269  svc:billing --owns--> table:invoices
                  svc:billi
 
-ep2  1789902683  job:invoice_export --status--> failed
+ep2  1789904269  job:invoice_export --status--> failed
 ```
 
 **Store shape at a glance**
@@ -263,22 +263,44 @@ sqlite3 memory.db "PRAGMA integrity_check;"   # -> ok
 binary was built for; there is **no migration path**, by design — the store
 is a rebuildable projection, not a system of record.
 
-A store written against an older schema fails to load:
+A store written against an older schema fails to load, and the run stops
+there:
 
 ```console
-$ lemmalog-cli query --goal 'current(S,R,O)'
-lemmalog-cli: store load failed (store schema version 1 is older than this binary's schema version 2; no migration path exists — delete this store and rebuild it (save again from a snapshot or a running memory)); starting fresh
-(no answers — asserted facts are current(S, rel, O))
+$ LEMMALOG_MCP_PATH=stale.db lemmalog-cli query --goal 'current(S,R,O)'
+lemmalog-cli: "stale.db" exists but could not be loaded (store schema version 1 is older than this binary's schema version 2; no migration path exists — delete this store and rebuild it (save again from a snapshot or a running memory)).
+  Refusing to run: continuing with an empty memory would overwrite this store on the next save.
+  Move or delete the file, or point LEMMALOG_MCP_PATH elsewhere.
+$ echo $?
+3
 ```
 
-> **Watch this one.** The CLI reports the failure and then **starts
-> fresh**. The old rows are still on disk at that moment, but the next
-> write overwrites the file with the new, empty memory. Verified: after one
-> `observe` against the stale store, only the newly asserted edge remained.
-> If a store fails to load, **copy it aside before running anything else**.
+**Existence** is what separates a first run from a damaged store, so it is
+what the binaries branch on:
 
-To rebuild: replay the facts into a new store (§8), or `save` again from a
-running memory.
+| Store file | Behaviour |
+| --- | --- |
+| absent | start fresh; the first write creates and initialises it |
+| present, loads | normal run |
+| present, will not load (schema mismatch, corruption, parse failure) | print the error, **exit 3**, write nothing |
+
+A refused run leaves the file byte-identical: the version is checked before
+anything is opened for writing, and `save` re-checks it before it opens its
+transaction, so a refused `save` writes nothing either. `lemmalog-mcp`
+applies the same rule at startup rather than serving an empty memory over a
+store it could not read:
+
+```console
+$ LEMMALOG_MCP_PATH=stale.db lemmalog-mcp
+lemmalog-mcp: "stale.db" exists but could not be loaded: store schema version 1 is older than this binary's schema version 2; no migration path exists — delete this store and rebuild it (save again from a snapshot or a running memory)
+  Refusing to start: serving an empty memory would overwrite this store on the first write.
+  Move or delete the file, or point LEMMALOG_MCP_PATH elsewhere.
+$ echo $?
+3
+```
+
+To rebuild: move the old file aside, then replay the facts into a new store
+(§8) or `save` again from a running memory.
 
 ## 8. Worked example: moving a snapshot setup to SQLite
 

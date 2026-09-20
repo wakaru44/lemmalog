@@ -6,7 +6,9 @@
 //!
 //!   lemmalog-cli observe  --facts 'alice --works_at--> acme'
 //!   lemmalog-cli query   --goal 'current("alice", R, O)'
-//!   lemmalog-cli retract --facts 'alice --works_at--> acme'
+//!   lemmalog-cli retract --facts 'alice --works_at--> acme' [--reason world_changed]
+//!   lemmalog-cli suspects
+//!   lemmalog-cli reverify --facts 'alice --manager--> bob'
 //!   lemmalog-cli context --query 'where does alice work'
 //!   lemmalog-cli why     --fact 'reports_to(alice, carol)'
 //!   lemmalog-cli rules   --rules 'reach(X,Z) :- current(X,"dep",Y), reach(Y,Z).'
@@ -25,6 +27,7 @@
 #![cfg(feature = "mcp")]
 
 use lemmalog::agent::{AgentMemory, MockExtractor};
+use lemmalog::RetractReason;
 use std::io::Read;
 
 fn snap_path() -> String {
@@ -117,9 +120,29 @@ fn sync_clock(m: &mut AgentMemory<MockExtractor>) {
     }
 }
 
+/// Absent store -> start fresh. Present but unreadable -> refuse.
+///
+/// "Start fresh on any load error" is right for a first run and catastrophic
+/// for a store that exists and cannot be parsed (schema mismatch, corruption):
+/// the fresh memory is empty, and the next `store_save` writes it over the
+/// file the load guard was protecting. Existence is the only thing that
+/// separates the two cases, so it is what we branch on.
 fn load(path: &str) -> AgentMemory<MockExtractor> {
     let mut m = match store_load(path) {
         Ok(m) => m,
+        // A store that exists and will not load (schema mismatch, corruption)
+        // must stop the run. Falling through to an empty memory is what made
+        // this data loss: the memory is empty, and the very next `store_save`
+        // writes it straight over the file the load guard was protecting.
+        // Only absence is a legitimate "start fresh".
+        Err(e) if std::path::Path::new(path).exists() => {
+            eprintln!(
+                "lemmalog-cli: {path:?} exists but could not be loaded ({e}).\n  Refusing to run: \
+                 continuing with an empty memory would overwrite this store on the next save.\n  \
+                 Move or delete the file, or point LEMMALOG_MCP_PATH elsewhere."
+            );
+            std::process::exit(3);
+        }
         Err(e) => {
             eprintln!("lemmalog-cli: store load failed ({e}); starting fresh");
             AgentMemory::new(MockExtractor::new(0.9), "").expect("fresh memory")
@@ -159,23 +182,64 @@ fn main() {
             sync_clock(&mut m);
             let _ = m.maintain(m.engine.now);
             store_save(&m, &snap_path()).expect("save store");
+            // `rejected=` is appended only when non-zero, so a run with no
+            // ontology loaded prints byte-for-byte what it always printed.
+            let rej = if report.rejected.is_empty() {
+                String::new()
+            } else {
+                format!(" rejected={}", report.rejected.len())
+            };
             println!(
-                "added={} updated={} noop={} escalations={}",
+                "added={} updated={} noop={} escalations={}{rej}",
                 report.added,
                 report.updated,
                 report.noop,
                 report.escalations.len()
             );
+            // Each entry already reads "rejected: S --rel--> O (why)".
+            for r in report.rejected.iter().take(5) {
+                println!("{r}");
+            }
+            if report.rejected.len() > 5 {
+                println!("(+{} more rejected)", report.rejected.len() - 5);
+            }
             for d in dropped.iter().take(5) {
                 println!("dropped: {} ({})", d.0, d.1);
             }
         }
         "retract" => {
             let mut m = load(&snap_path());
+            // Default `wrong`: existing scripted callers keep today's
+            // delete-and-kill-dependents behaviour byte for byte.
+            let reason = match flag(&args, "--reason") {
+                None => RetractReason::Wrong,
+                Some(r) => match RetractReason::parse(&r) {
+                    Some(r) => r,
+                    None => {
+                        eprintln!(
+                            "lemmalog-cli: unknown --reason {r:?}; valid: wrong, world_changed, \
+                             superseded"
+                        );
+                        std::process::exit(2);
+                    }
+                },
+            };
             let text = stdin_or_flag(&args, "--facts");
-            let (done, missing, died) = m.retract_facts(&text);
+            let (done, missing, died) = m.retract_facts_because(&text, reason, None);
+            // The closure markers only become facts the `suspect` rules can
+            // join on when `maintain` lifts them out of provenance.
+            if reason != RetractReason::Wrong {
+                let _ = m.maintain(m.engine.now);
+            }
             store_save(&m, &snap_path()).expect("save store");
             println!("retracted {} fact(s)", done.len());
+            if reason != RetractReason::Wrong {
+                println!(
+                    "reason={}; {} fact(s) now suspect (see: lemmalog-cli suspects)",
+                    reason.as_str(),
+                    m.reverification_queue().len()
+                );
+            }
             if !died.is_empty() {
                 println!("{} derived fact(s) died:", died.len());
                 for d in died.iter().take(15) {
@@ -185,6 +249,49 @@ fn main() {
             for mi in &missing {
                 println!("not found: {mi}");
             }
+        }
+        "suspects" => {
+            let mut m = load(&snap_path());
+            // `maintain` is what lifts the retraction markers into the base
+            // facts the suspect rules read: a store merely loaded reports an
+            // empty queue until it runs.
+            let _ = m.maintain(m.engine.now);
+            let queue = m.reverification_queue();
+            if queue.is_empty() {
+                println!("re-verification queue empty");
+            } else {
+                println!("{} suspect fact(s):", queue.len());
+                for s in &queue {
+                    println!("  {}", s.fact);
+                    println!(
+                        "    closed support: {} (at {})",
+                        s.closed_support, s.closed_at
+                    );
+                    for line in s.why.lines() {
+                        println!("    why: {line}");
+                    }
+                }
+                println!(
+                    "clear one with: lemmalog-cli reverify --facts '<S --rel--> O>' \
+                     (re-read current evidence first — this asserts confidence 1.0)"
+                );
+            }
+        }
+        "reverify" => {
+            let mut m = load(&snap_path());
+            let text = stdin_or_flag(&args, "--facts");
+            let at = flag(&args, "--ts")
+                .and_then(|t| t.parse::<i64>().ok())
+                .unwrap_or_else(wall_clock);
+            let (done, missing) = m.reverify(&text, at);
+            // reverify() sets the clock to `at`; don't persist a past NOW.
+            let _ = m.maintain(m.engine.now.max(wall_clock()));
+            store_save(&m, &snap_path()).expect("save store");
+            println!("re-verified {} fact(s) at confidence 1.0", done.len());
+            for mi in &missing {
+                println!("not found (no open fact matches): {mi}");
+            }
+            println!("{} fact(s) still suspect", m.reverification_queue().len());
         }
         "query" => {
             let m = load(&snap_path());
@@ -270,8 +377,11 @@ fn main() {
         }
         other => {
             eprintln!(
-                "usage: lemmalog-cli observe|retract|query|context|why|rules|rmrules|batches|dump [flags]\n\
-                 flags: --facts|--goal|--query|--fact|--rules|--id|--pred|--ts|--budget  (or stdin)\n\
+                "usage: lemmalog-cli observe|retract|suspects|reverify|query|context|why|rules|rmrules|batches|dump [flags]\n\
+                 flags: --facts|--goal|--query|--fact|--rules|--id|--pred|--ts|--budget|--reason  (or stdin)\n\
+                 retract --reason wrong (default: deletes, dependents die) | world_changed | superseded\n\
+                   (world_changed/superseded close the fact in valid time and mark dependents\n\
+                    suspect — list them with `suspects`, clear them with `reverify`)\n\
                  unknown command {other:?}"
             );
             std::process::exit(2);

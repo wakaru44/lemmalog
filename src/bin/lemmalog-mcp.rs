@@ -29,6 +29,7 @@ use lemmalog::agent::AgentMemory;
 use lemmalog::canonical;
 use lemmalog::eval::Engine;
 use lemmalog::intern::Value;
+use lemmalog::RetractReason;
 use serde_json::{json, Value as J};
 use std::io::{BufRead, Write};
 
@@ -103,7 +104,17 @@ fn main() {
         if std::path::Path::new(p).exists() {
             match store_load(p) {
                 Ok(m) => memory = m,
-                Err(e) => eprintln!("lemmalog-mcp: store load failed: {e}"),
+                // The file is there and will not load (schema mismatch,
+                // corruption). Serving a fresh memory over it loses the
+                // store the moment any tool call saves, so refuse to start.
+                Err(e) => {
+                    eprintln!(
+                        "lemmalog-mcp: {p:?} exists but could not be loaded: {e}\n  Refusing to \
+                         start: serving an empty memory would overwrite this store on the first \
+                         write.\n  Move or delete the file, or point LEMMALOG_MCP_PATH elsewhere."
+                    );
+                    std::process::exit(3);
+                }
             }
         }
     }
@@ -155,7 +166,11 @@ fn tools() -> J {
         tool("lemmalog_observe",
             "Assert facts into memory (host model does extraction). Input: facts in the line protocol 'S --rel[conf]--> O', one per line; optional ts integer = the facts' valid-from time (default: now). Backdating with ts is safe: it sets valid-time only, never the clock reads use. Example: 'Alice --works_at--> Acme\\nBob --manager--> Carol'.", &["facts", "ts"], &["facts"]),
         tool("lemmalog_retract",
-            "Retract facts that turned out to be WRONG (line protocol, same as observe). Open matching rows are removed and invalidation propagates: the response reports which derived facts died as a consequence. For a value that merely CHANGED, prefer re-asserting the same relation (the update policy supersedes).", &["facts"], &["facts"]),
+            "Retract facts (line protocol, same as observe). Optional `reason` (default 'wrong'): 'wrong' = we misread, it was never true — the row is deleted and everything derived from it dies; 'world_changed' = it WAS true until now — the row is closed in valid time, the earlier period stays true, and what rests on it becomes SUSPECT (see lemmalog_suspects) rather than dying; 'superseded' = an exclusive relation took a new value. The response reports which derived facts died.", &["facts", "reason"], &["facts"]),
+        tool("lemmalog_suspects",
+            "The re-verification queue: facts that are neither true nor false. Something each one rests on stopped being true because the world moved on, so it was correct for an earlier period and nobody has checked it against current reality since. Returns each suspect fact, the support that was closed, when, and why. Don't answer from these; go re-read the evidence. Clearing one takes lemmalog_reverify — re-verification at confidence 1.0 against evidence you have just re-read, never a re-assertion from memory or inference.", &[], &[]),
+        tool("lemmalog_reverify",
+            "Clear suspicion (see lemmalog_suspects): re-assert facts (line protocol) at confidence 1.0 after re-reading current evidence; optional ts (default: now). Only for what you have just checked against current reality — anything inferred, remembered, or carried over from the observation already under suspicion goes to a human instead.", &["facts", "ts"], &["facts"]),
         tool("lemmalog_query",
             "Query derived memory: a goal atom like 'reports_to(\"Alice\", Y)' or 'current(X, works_at, O)'. Returns variable bindings. Read-only.", &["goal"], &["goal"]),
         tool("lemmalog_query_deep",
@@ -207,6 +222,7 @@ fn prop_desc(p: &str) -> &'static str {
         "query" => "natural-language query",
         "budget_tokens" => "context token budget",
         "since" => "epoch checkpoint",
+        "reason" => "wrong | world_changed | superseded",
         _ => "",
     }
 }
@@ -366,13 +382,35 @@ fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Res
                 mem.engine.invalidate_derived();
             }
             mem.maintain(now);
+            // `rejected=` is appended only when non-zero, so a store with no
+            // ontology loaded reports exactly what it always reported.
+            let rej = if report.rejected.is_empty() {
+                String::new()
+            } else {
+                format!(" rejected={}", report.rejected.len())
+            };
             let mut out = format!(
-                "added={} updated={} noop={} escalations={}",
+                "added={} updated={} noop={} escalations={}{rej}",
                 report.added,
                 report.updated,
                 report.noop,
                 report.escalations.len()
             );
+            // Ontology refusals first: an agent that cannot see them retries
+            // the same bad fact forever. Each entry already reads
+            // "rejected: S --rel--> O (why)".
+            if !report.rejected.is_empty() {
+                out.push_str(&format!(
+                    "\n{} fact(s) refused by the ontology — NOT asserted:",
+                    report.rejected.len()
+                ));
+                for r in report.rejected.iter().take(5) {
+                    out.push_str(&format!("\n  {r}"));
+                }
+                if report.rejected.len() > 5 {
+                    out.push_str(&format!("\n  (+{} more)", report.rejected.len() - 5));
+                }
+            }
             for e in report.escalations.iter().take(3) {
                 out.push_str(&format!("\nescalation: {e}"));
             }
@@ -398,13 +436,32 @@ fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Res
         }
         "lemmalog_retract" => {
             let facts = args["facts"].as_str().unwrap_or_default();
+            let reason = match args["reason"].as_str().filter(|r| !r.trim().is_empty()) {
+                None => Some(RetractReason::Wrong),
+                Some(r) => RetractReason::parse(r.trim()),
+            };
             if facts.trim().is_empty() {
                 Err("input: `facts` is required — line-protocol facts to retract".to_string())
+            } else if reason.is_none() {
+                Err(format!(
+                    "input: unknown `reason` {:?} — valid values: wrong, world_changed, superseded",
+                    args["reason"].as_str().unwrap_or_default()
+                ))
             } else {
+                let reason = reason.unwrap();
                 // invalidation is computed against the derived view, so the
                 // clock has to be current before we decide what dies
                 sync_clock(state);
-                let (done, missing, died) = state.memory.retract_facts(facts);
+                let (done, missing, died) = state.memory.retract_facts_because(facts, reason, None);
+                // only `maintain` lifts the closure markers into the base
+                // facts the `suspect` rules join on
+                let suspect = if reason == RetractReason::Wrong {
+                    None
+                } else {
+                    let now = state.memory.engine.now;
+                    state.memory.maintain(now);
+                    Some(state.memory.reverification_queue().len())
+                };
                 let mut out = String::new();
                 if !done.is_empty() {
                     out.push_str(&format!(
@@ -422,6 +479,13 @@ fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Res
                             out.push_str(&format!("    (+{} more)\n", died.len() - 15));
                         }
                     }
+                    if let Some(n) = suspect {
+                        out.push_str(&format!(
+                            "  reason={}: the earlier period stays true; {n} fact(s) now suspect \
+                             (lemmalog_suspects)\n",
+                            reason.as_str()
+                        ));
+                    }
                 }
                 if !missing.is_empty() {
                     out.push_str(&format!(
@@ -435,6 +499,66 @@ fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Res
 (strict validation: S --rel--> O with real entity names)",
                     );
                 }
+                Ok(out)
+            }
+        }
+        "lemmalog_suspects" => {
+            sync_clock(state);
+            // a store that was merely loaded has its retraction markers still
+            // in provenance; `maintain` is what makes the queue derivable
+            let now = state.memory.engine.now;
+            state.memory.maintain(now);
+            let queue = state.memory.reverification_queue();
+            if queue.is_empty() {
+                return Ok(json!({
+                    "content": [{"type": "text", "text": "re-verification queue empty — nothing is suspect"}],
+                    "isError": false
+                }));
+            }
+            let mut out = format!(
+                "{} suspect fact(s) — neither true nor false: each was correct for an earlier \
+                 period and is UNVERIFIED against current reality. Re-read the evidence, then \
+                 lemmalog_reverify at confidence 1.0.\n",
+                queue.len()
+            );
+            for s in queue.iter().take(25) {
+                out.push_str(&format!(
+                    "  {}\n    closed support: {} (at {})\n",
+                    s.fact, s.closed_support, s.closed_at
+                ));
+                for line in s.why.lines() {
+                    out.push_str(&format!("    why: {line}\n"));
+                }
+            }
+            if queue.len() > 25 {
+                out.push_str(&format!("  (+{} more)\n", queue.len() - 25));
+            }
+            Ok(out)
+        }
+        "lemmalog_reverify" => {
+            let facts = args["facts"].as_str().unwrap_or_default().to_string();
+            if facts.trim().is_empty() {
+                Err("input: `facts` is required — line-protocol facts you have just re-read \
+                     current evidence for"
+                    .to_string())
+            } else {
+                sync_clock(state);
+                let at = args["ts"].as_i64().unwrap_or(state.memory.engine.now);
+                let (done, missing) = state.memory.reverify(&facts, at);
+                // reverify() set the clock to `at`; never persist a past NOW
+                let now = state.memory.engine.now.max(wall_clock());
+                state.memory.maintain(now);
+                let mut out = format!("re-verified {} fact(s) at confidence 1.0\n", done.len());
+                if !missing.is_empty() {
+                    out.push_str(&format!(
+                        "not found (no open fact matches):\n  {}\n",
+                        missing.join("\n  ")
+                    ));
+                }
+                out.push_str(&format!(
+                    "{} fact(s) still suspect",
+                    state.memory.reverification_queue().len()
+                ));
                 Ok(out)
             }
         }
@@ -687,6 +811,8 @@ fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Res
             let known: Vec<&str> = [
                 "lemmalog_observe",
                 "lemmalog_retract",
+                "lemmalog_suspects",
+                "lemmalog_reverify",
                 "lemmalog_query",
                 "lemmalog_query_deep",
                 "lemmalog_why",
@@ -735,6 +861,7 @@ fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Res
             name,
             "lemmalog_observe"
                 | "lemmalog_retract"
+                | "lemmalog_reverify"
                 | "lemmalog_install_rules"
                 | "lemmalog_uninstall"
                 | "lemmalog_canonicalize"
@@ -775,7 +902,7 @@ mod tests {
     fn every_tool_schema_lists_only_its_own_properties() {
         let ts = tools();
         let list = ts.as_array().unwrap();
-        assert_eq!(list.len(), 15);
+        assert_eq!(list.len(), 17);
         for t in list {
             let props: Vec<&str> = t["inputSchema"]["properties"]
                 .as_object()

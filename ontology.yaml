@@ -5,8 +5,12 @@
 # entity may sit either side (domain/range), and whether asserting it
 # obliges a sibling `evidence` fact.
 #
-# STATUS: DESIGN ONLY. Nothing reads this file yet. The engine still
-# decides cardinality by prefix match in `apply_update` (src/agent.rs).
+# STATUS: IMPLEMENTED, OPT-IN. Enforcement ships in src/ontology.rs and
+# runs only when an ontology is actually loaded: set LEMMALOG_ONTOLOGY to
+# this file's path, or call `set_ontology` / `set_ontology_path` /
+# `with_ontology`. With nothing loaded, nothing here is enforced and the
+# engine falls back to deciding cardinality by prefix match in
+# `apply_update` (src/agent.rs).
 # See docs/ontology.md for the mapping and the migration note.
 
 version: 1

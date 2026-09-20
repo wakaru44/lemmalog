@@ -106,9 +106,37 @@ impl Retraction {
     }
 }
 
+/// Refuse a store written at a schema version that is not ours, before
+/// anything reads or writes it. A store with no meta rows has never been
+/// written — that is the "start fresh" case (the schema is created on
+/// open), not a mismatch. Anything with meta in it was written by some
+/// binary, and must say which.
+fn check_version(conn: &Connection) -> Res<()> {
+    let written: i64 = conn.query_row("SELECT count(*) FROM meta", [], |r| r.get(0))?;
+    if written == 0 {
+        return Ok(());
+    }
+    let mut q = conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
+    let mut rows = q.query([VERSION_KEY])?;
+    let stored: Option<String> = match rows.next()? {
+        Some(r) => Some(r.get(0)?),
+        None => None,
+    };
+    let found = stored
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(OLDEST_VERSION);
+    if found != SCHEMA_VERSION {
+        return Err(version_error(found).into());
+    }
+    Ok(())
+}
+
 /// Persist to a SQLite store, replacing whatever it held.
 pub fn save<X: Extractor>(m: &AgentMemory<X>, path: &str) -> Res<()> {
     let mut conn = open(path)?;
+    // Before the transaction, and so before the nine DELETEs: a refused
+    // save must leave the existing store untouched, not truncated.
+    check_version(&conn)?;
     let tx = conn.transaction()?;
     for t in [
         "edge_prov",
@@ -238,7 +266,30 @@ pub fn save<X: Extractor>(m: &AgentMemory<X>, path: &str) -> Res<()> {
     }
 
     tx.commit()?;
+    // Only now, with the write durably committed: fold the WAL back into
+    // the main file so `store.db` is complete on its own. Without this, an
+    // operator who copies/backs up/commits just the `.db` — leaving the
+    // `-wal` sidecar behind — silently loses the most recent saves.
+    checkpoint(&conn);
     Ok(())
+}
+
+/// `PRAGMA wal_checkpoint(TRUNCATE)`: move every committed WAL frame into
+/// the main database file and reset the `-wal` file to zero length.
+///
+/// Deliberately infallible. It runs *after* the commit, so the data is
+/// already durable; a checkpoint that cannot complete (another connection
+/// holding a read lock is the common case) is an on-disk tidiness miss,
+/// not a lost write. Failing the save there would report a correctness
+/// problem that does not exist and, worse, invite the caller to retry a
+/// save that already succeeded. The result is swallowed rather than
+/// propagated for exactly that reason; the store stays readable by any
+/// SQLite client, `-wal` and all.
+///
+/// `wal_checkpoint` returns a row (busy, log frames, checkpointed
+/// frames), so it needs the query form — `execute` rejects it.
+fn checkpoint(conn: &Connection) {
+    let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
 }
 
 /// Load a store into a fresh memory with the given extractor. Base facts
@@ -254,19 +305,7 @@ pub fn load<X: Extractor>(extractor: X, path: &str) -> Res<AgentMemory<X>> {
             None => None,
         })
     };
-    // A store that has never been written has no meta rows at all — that is
-    // the "start fresh" case (the schema is created on open), not a version
-    // mismatch. Anything with meta in it was written by some binary, and
-    // must say which.
-    let written: i64 = conn.query_row("SELECT count(*) FROM meta", [], |r| r.get(0))?;
-    if written > 0 {
-        let found = meta(VERSION_KEY)?
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(OLDEST_VERSION);
-        if found != SCHEMA_VERSION {
-            return Err(version_error(found).into());
-        }
-    }
+    check_version(&conn)?;
 
     let now: i64 = meta("now")?.unwrap_or_default().parse().unwrap_or(0);
     let rules = meta("extra_rules")?.unwrap_or_default();
@@ -665,6 +704,175 @@ mod tests {
         let empty: AgentMemory<MockExtractor> = load(MockExtractor::new(0.9), &fresh).unwrap();
         assert!(empty.episodes.is_empty());
         let _ = std::fs::remove_file(&fresh);
+    }
+
+    /// Same shape as [`load_err`]: `save` is refused, never panics.
+    fn save_err<X: Extractor>(m: &AgentMemory<X>, path: &str) -> String {
+        match save(m, path) {
+            Ok(()) => panic!("save must refuse a version mismatch"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// A refused save must not have touched the store, so compare the file
+    /// itself — row counts would still pass if the DELETEs had run and been
+    /// rolled back into a rewritten file.
+    fn bytes(path: &str) -> Vec<u8> {
+        std::fs::read(path).unwrap()
+    }
+
+    /// (a)+(b) an older store refuses the save with the rebuild message and
+    /// the file comes out byte-for-byte as it went in.
+    #[test]
+    fn save_into_an_older_store_is_refused_and_changes_nothing() {
+        let path = saved_store("save-older.db");
+        set_version(&path, Some("1"));
+        let before = bytes(&path);
+
+        let mut m = AgentMemory::new(MockExtractor::new(0.9), "").unwrap();
+        m.observe_extracted("bob --lives_in--> madrid", 100);
+        m.maintain(100);
+        let e = save_err(&m, &path);
+
+        assert!(e.contains("version 1 is older"), "{e}");
+        assert!(e.contains("no migration path") && e.contains("rebuild"), "{e}");
+        assert_eq!(e, load_err(&path), "save and load must say the same thing");
+        assert_eq!(bytes(&path), before, "a refused save must not touch the file");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// (c) a store from a newer binary: upgrade, do not clobber.
+    #[test]
+    fn save_into_a_newer_store_is_refused_and_changes_nothing() {
+        let path = saved_store("save-newer.db");
+        set_version(&path, Some(&(SCHEMA_VERSION + 1).to_string()));
+        let before = bytes(&path);
+
+        let m = AgentMemory::new(MockExtractor::new(0.9), "").unwrap();
+        let e = save_err(&m, &path);
+
+        assert!(e.contains("is newer") && e.contains("upgrade the binary"), "{e}");
+        assert_eq!(e, load_err(&path));
+        assert_eq!(bytes(&path), before);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// (d) a pre-guard store has no version key at all; it is the oldest
+    /// known version, so it gets the rebuild message too.
+    #[test]
+    fn save_into_a_keyless_store_is_refused_and_changes_nothing() {
+        let path = saved_store("save-keyless.db");
+        set_version(&path, None);
+        let before = bytes(&path);
+
+        let m = AgentMemory::new(MockExtractor::new(0.9), "").unwrap();
+        let e = save_err(&m, &path);
+
+        assert!(e.contains("no migration path") && e.contains("rebuild"), "{e}");
+        assert_eq!(e, load_err(&path));
+        assert_eq!(bytes(&path), before);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// (e)+(f) the normal first save writes the current version, and the
+    /// store it leaves behind round-trips.
+    #[test]
+    fn first_save_stamps_the_current_version_and_round_trips() {
+        let path = saved_store("save-fresh.db");
+        let stamped: String = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT value FROM meta WHERE key = ?1", [VERSION_KEY], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stamped, SCHEMA_VERSION.to_string());
+
+        let back: AgentMemory<MockExtractor> = load(MockExtractor::new(0.9), &path).unwrap();
+        assert_eq!(back.episodes.len(), 1);
+        assert_eq!(back.engine.relations["edge"].rows.len(), 1);
+        save(&back, &path).unwrap(); // a matching version saves again fine
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The point of the checkpoint: a `.db` copied WITHOUT its `-wal` and
+    /// `-shm` sidecars must still hold everything the last save wrote.
+    /// This is the copy/backup/commit path an operator actually takes.
+    #[test]
+    fn the_db_file_alone_carries_the_last_save() {
+        let path = scratch("self-contained.db");
+        let mut m = AgentMemory::new(MockExtractor::new(0.9), "").unwrap();
+        m.observe_extracted("alice --lives_in--> berlin", 100);
+        m.maintain(100);
+        save(&m, &path).unwrap(); // the store as it stood before the writes below
+
+        // A second connection on the store, held open (and actually
+        // touching the file — SQLite opens lazily) across the save that
+        // follows. Not decoration: SQLite checkpoints on the close of the
+        // LAST connection, which would hide the bug entirely. A live
+        // reader — the MCP server, a `sqlite3` shell — is also the
+        // realistic state of the world when an operator reaches for `cp`.
+        let reader = Connection::open(&path).unwrap();
+        let seen: i64 = reader
+            .query_row("SELECT count(*) FROM episodes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(seen, 1);
+
+        for i in 1..=40 {
+            m.episodes.push(Episode {
+                id: format!("bulk{i}"),
+                ts: 100,
+                speaker: None,
+                text: format!("padding line {i}"),
+            });
+        }
+        m.episode_counter = m.episodes.len() as u64;
+        save(&m, &path).unwrap();
+
+        // TRUNCATE leaves the sidecar at zero length (or gone): either way
+        // it carries nothing, which is the whole claim.
+        let wal_len = std::fs::metadata(format!("{path}-wal"))
+            .map(|x| x.len())
+            .unwrap_or(0);
+        assert_eq!(wal_len, 0, "the WAL must be empty after a successful save");
+
+        // Copy ONLY the .db, the way `cp store.db backup/` does.
+        let copy = scratch("self-contained-copy.db");
+        std::fs::copy(&path, &copy).unwrap();
+        assert!(!std::path::Path::new(&format!("{copy}-wal")).exists());
+
+        let back: AgentMemory<MockExtractor> = load(MockExtractor::new(0.9), &copy).unwrap();
+        assert_eq!(back.episodes.len(), m.episodes.len(), "episodes survived the copy");
+        assert_eq!(back.episodes[40].id, "bulk40");
+        assert_eq!(
+            back.engine.relations["edge"].rows.len(),
+            m.engine.relations["edge"].rows.len(),
+            "edges survived the copy"
+        );
+        drop(reader);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&copy);
+    }
+
+    /// A refused save must not checkpoint either: the file stays
+    /// byte-identical, and nothing of the caller's memory reaches the WAL.
+    #[test]
+    fn a_refused_save_does_not_checkpoint() {
+        let path = saved_store("refused-no-checkpoint.db");
+        set_version(&path, Some(&(SCHEMA_VERSION + 1).to_string()));
+        let before = bytes(&path);
+
+        let mut m = AgentMemory::new(MockExtractor::new(0.9), "").unwrap();
+        m.observe_extracted("bob --lives_in--> madrid", 100);
+        m.maintain(100);
+        let e = save_err(&m, &path);
+        assert!(e.contains("is newer"), "{e}");
+
+        assert_eq!(bytes(&path), before, "a refused save must not touch the file");
+        let wal_len = std::fs::metadata(format!("{path}-wal"))
+            .map(|x| x.len())
+            .unwrap_or(0);
+        assert_eq!(wal_len, 0, "a refused save writes nothing, so nothing to fold in");
+        let _ = std::fs::remove_file(&path);
     }
 
     fn counts<X: Extractor>(m: &AgentMemory<X>) -> Vec<(String, usize)> {
