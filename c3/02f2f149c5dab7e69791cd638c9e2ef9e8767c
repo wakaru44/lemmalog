@@ -1,0 +1,23 @@
+Cargo.lock
+  s_e6045d8ee74ea2::t_b3323a5b53f080 11-22,29-34,71-82,119-136,251,262-272,313-318,360-373,570-581,708-727
+Cargo.toml
+  s_e6045d8ee74ea2::t_490913a1ebde52 11,44-46
+src/storage/schema.sql
+  s_e6045d8ee74ea2::t_3ec83534403c4f 1-103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c302f2f149c5dab7e69791cd638c9e2ef9e8767c",
+  "prompts": {},
+  "sessions": {
+    "s_e6045d8ee74ea2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcbf69c7-331f-48cd-9532-bb93ed8b4605",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Wakaru Himura <wakaru44@gmail.com>"
+    }
+  }
+}
