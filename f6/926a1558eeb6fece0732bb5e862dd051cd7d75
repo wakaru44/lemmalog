@@ -1,0 +1,41 @@
+src/agent.rs
+  s_e6045d8ee74ea2::t_eef29c47afbad7 717-729
+  s_e6045d8ee74ea2::t_7767784b4a89fb 385-389
+  s_e6045d8ee74ea2::t_5179655dec0f88 15
+  s_e6045d8ee74ea2::t_5b81cabe58dbc8 637-642,644-648
+  s_e6045d8ee74ea2::t_1bca4811fa5a71 787
+  s_e6045d8ee74ea2::t_0cc8223d6ee114 424-450
+  s_e6045d8ee74ea2::t_0c3e02c964db9f 494,498-581
+  s_e6045d8ee74ea2::t_4da3ec984d385c 582,2156-2355
+src/lib.rs
+  s_e6045d8ee74ea2::t_729ec294d32ac2 50-55,57-59
+src/storage/mod.rs
+  s_e6045d8ee74ea2::t_2578096d48e632 129
+  s_e6045d8ee74ea2::t_3f5418111b68fd 257-270
+  s_e6045d8ee74ea2::t_17482b261084b1 279-281,283
+  s_e6045d8ee74ea2::t_e2ae48cc67a915 398-416
+  s_e6045d8ee74ea2::t_9999b89ec0b640 580-661
+  s_e6045d8ee74ea2::t_bbcdddb47a4fd3 145-148
+  s_e6045d8ee74ea2::t_95ca8e4ab7f837 25-35
+  s_e6045d8ee74ea2::t_b4d7bb2db95120 662-669
+docs/storage.md
+  s_e6045d8ee74ea2::t_0dda473f27d2c1 1-335
+src/storage/schema.sql
+  s_e6045d8ee74ea2::t_d6e77f1a0855c3 7-9,102-105,107-108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f6926a1558eeb6fece0732bb5e862dd051cd7d75",
+  "prompts": {},
+  "sessions": {
+    "s_e6045d8ee74ea2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcbf69c7-331f-48cd-9532-bb93ed8b4605",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Wakaru Himura <wakaru44@gmail.com>"
+    }
+  }
+}
