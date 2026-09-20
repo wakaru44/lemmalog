@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 serde_json = { version = "1", optional = true }
 ureq = { version = "2", optional = true }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
 [[bin]]
 name = "lemmalog-mcp"
@@ -40,3 +41,6 @@ llm = ["dep:ureq", "dep:serde_json"]
 # MCP server binary (Model Context Protocol over stdio) for agent CLIs
 # (Claude Code, Kimi CLI, ...). Needs only serde_json.
 mcp = ["dep:serde_json"]
+# SQLite-backed store, replacing the single-snapshot file. Synchronous,
+# matching the existing save/load signatures -- see ADR 1 (narrow diff).
+sqlite = ["dep:rusqlite"]
