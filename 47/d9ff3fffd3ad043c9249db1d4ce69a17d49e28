@@ -1,0 +1,42 @@
+docs/storage.md
+  s_e6045d8ee74ea2::t_1daf41f4982f13 746
+  s_e6045d8ee74ea2::t_cbc13cb8937bf7 522-524
+  s_e6045d8ee74ea2::t_c53523b0b5503c 712-713,723,781-806
+  s_e6045d8ee74ea2::t_5de26b72e2485c 710-711
+  s_e6045d8ee74ea2::t_4a5e4ad8967471 720-722
+  s_e6045d8ee74ea2::t_5968262ff75810 724
+  s_e6045d8ee74ea2::t_7135717f110d05 743-745
+  s_e6045d8ee74ea2::t_aba92d54fcda1e 747-749,778-780
+  s_e6045d8ee74ea2::t_6ab5eef672be49 807-809
+  s_969385f9043ebc::t_a4cd59808a9233 526,528-530,532-535,537-613,616-637,641,646-707,716-717,727-733,735-741,750-777,810-815
+src/bin/lemmalog-cli.rs
+  s_e6045d8ee74ea2::t_90599030a405aa 16-19
+  s_e6045d8ee74ea2::t_ca0a5bc01db4a4 489-549,551-564,567-571
+  s_e6045d8ee74ea2::t_ddaed4c8eac013 550
+README.md
+  s_e6045d8ee74ea2::t_a8b864e0656977 3-31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "47d9ff3fffd3ad043c9249db1d4ce69a17d49e28",
+  "prompts": {},
+  "sessions": {
+    "s_969385f9043ebc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad13ed5eb9d73f7f5",
+        "model": "unknown"
+      },
+      "human_author": "Wakaru Himura <wakaru44@gmail.com>"
+    },
+    "s_e6045d8ee74ea2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcbf69c7-331f-48cd-9532-bb93ed8b4605",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Wakaru Himura <wakaru44@gmail.com>"
+    }
+  }
+}
