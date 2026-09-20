@@ -1,0 +1,25 @@
+docs/adr/0001-tracking-fork-narrow-diff.md
+  s_e6045d8ee74ea2::t_edb335d7827d03 1-18
+docs/adr/0002-three-retraction-reasons.md
+  s_e6045d8ee74ea2::t_d17d54c4213b32 1-19
+docs/adr/0003-defer-dag-valid-time.md
+  s_e6045d8ee74ea2::t_bab723fbf8d630 1-18
+docs/storage_sqlite_schema.md
+  s_e6045d8ee74ea2::t_1801b206781278 1-176
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "75cb9b1350fe142b388d8dfc771800b1ef8e929c",
+  "prompts": {},
+  "sessions": {
+    "s_e6045d8ee74ea2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcbf69c7-331f-48cd-9532-bb93ed8b4605",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Wakaru Himura <wakaru44@gmail.com>"
+    }
+  }
+}
