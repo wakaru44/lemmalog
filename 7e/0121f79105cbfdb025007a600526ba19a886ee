@@ -1,0 +1,33 @@
+docs/ontology.md
+  s_e6045d8ee74ea2::t_d597d2c4cae395 231-244,246-280
+  s_e6045d8ee74ea2::t_981a07d60a2427 217
+  s_e6045d8ee74ea2::t_8e4600d41b53b0 245
+  s_e6045d8ee74ea2::t_d1f6af854df900 214-216
+  s_e6045d8ee74ea2::t_606f18750b2d37 281
+docs/storage.md
+  s_e6045d8ee74ea2::t_094a1d390f8286 35-37,101,104,107,128-268,274,278-279,281,285-286,301,318,335,344-411,425-426,441,444-446,462,464,468,479,481-484,491,515,523,525,554,576-581
+tests/cli_behaviour.rs
+  s_e6045d8ee74ea2::t_85d6ca68fa1869 1-281
+docs/storage_sqlite_schema.md
+  s_e6045d8ee74ea2::t_fa8f429591fc6d 1-35
+src/bin/lemmalog-cli.rs
+  s_e6045d8ee74ea2::t_2921ea7b0068d2 7,26-29,33,159-229,254-263,284-289,488-490
+src/bin/lemmalog-mcp.rs
+  s_e6045d8ee74ea2::t_4739dcf134067a 14-18,33,92-162,243,303,448,453-460,462-466,490-492
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7e0121f79105cbfdb025007a600526ba19a886ee",
+  "prompts": {},
+  "sessions": {
+    "s_e6045d8ee74ea2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcbf69c7-331f-48cd-9532-bb93ed8b4605",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Wakaru Himura <wakaru44@gmail.com>"
+    }
+  }
+}
