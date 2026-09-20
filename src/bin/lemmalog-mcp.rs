@@ -6,7 +6,10 @@
 //! Register (Kimi CLI):     kimi mcp add lemmalog -- <path>/lemmalog-mcp
 //!
 //! Persistence: set LEMMALOG_MCP_PATH=/tmp/lemmalog.snapshot to keep
-//! memory across server restarts (saved after every mutating call).
+//! memory across server restarts (saved after every mutating call). A
+//! `.db`, `.sqlite` or `.sqlite3` extension selects the SQLite store
+//! instead (needs the `sqlite` feature); anything else is the
+//! tab-separated snapshot.
 //!
 //! The host model does the extraction (it reads the conversation anyway)
 //! and asserts triples via `observe`; Lemmalog derives closures,
@@ -33,15 +36,74 @@ struct State {
     memory: AgentMemory<lemmalog::agent::MockExtractor>,
 }
 
+/// Which backend a store path selects: `.db`, `.sqlite` and `.sqlite3`
+/// mean SQLite, anything else the tab-separated snapshot. The path is the
+/// one knob an operator already sets, so it carries the choice — a second
+/// mode flag would only be another thing to keep in sync with it.
+///
+/// This helper and the two wrappers below are duplicated verbatim in
+/// `lemmalog-cli.rs`. Sharing them would mean a new public module in
+/// `src/lib.rs`; for three stateless functions the duplicate is the
+/// narrower change (ADR 1).
+fn is_sqlite_store(path: &str) -> bool {
+    matches!(
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("db" | "sqlite" | "sqlite3")
+    )
+}
+
+/// Load from whichever backend the path names.
+///
+/// Only called when the file exists; a missing `.db` (like a missing
+/// snapshot) leaves the fresh memory alone, and the first save creates the
+/// schema via `CREATE TABLE IF NOT EXISTS`.
+fn store_load(
+    path: &str,
+) -> Result<AgentMemory<lemmalog::agent::MockExtractor>, Box<dyn std::error::Error>> {
+    #[cfg(feature = "sqlite")]
+    if is_sqlite_store(path) {
+        return lemmalog::storage::load(lemmalog::agent::MockExtractor::new(0.9), path);
+    }
+    AgentMemory::load(lemmalog::agent::MockExtractor::new(0.9), path)
+}
+
+/// Persist to whichever backend the path names.
+fn store_save(
+    m: &AgentMemory<lemmalog::agent::MockExtractor>,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "sqlite")]
+    if is_sqlite_store(path) {
+        return lemmalog::storage::save(m, path);
+    }
+    Ok(m.save(path)?)
+}
+
 fn main() {
     let path = std::env::var("LEMMALOG_MCP_PATH").ok();
+    // Refuse at startup rather than writing a snapshot into a file whose
+    // name promises SQLite.
+    if let Some(p) = &path {
+        if is_sqlite_store(p) && !cfg!(feature = "sqlite") {
+            eprintln!(
+                "lemmalog-mcp: {p:?} names a SQLite store but this binary was built without the \
+                 `sqlite` feature.\n  rebuild: cargo build --release --features mcp,sqlite\n  or \
+                 set LEMMALOG_MCP_PATH to a snapshot path (any extension but .db/.sqlite/.sqlite3)"
+            );
+            std::process::exit(2);
+        }
+    }
     let mut memory =
         AgentMemory::new(lemmalog::agent::MockExtractor::new(0.9), "").expect("fresh memory");
     if let Some(p) = &path {
         if std::path::Path::new(p).exists() {
-            match AgentMemory::load(lemmalog::agent::MockExtractor::new(0.9), p) {
+            match store_load(p) {
                 Ok(m) => memory = m,
-                Err(e) => eprintln!("lemmalog-mcp: snapshot load failed: {e}"),
+                Err(e) => eprintln!("lemmalog-mcp: store load failed: {e}"),
             }
         }
     }
@@ -609,9 +671,9 @@ fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Res
             let p = path.ok_or_else(|| {
                 "input: LEMMALOG_MCP_PATH not set — register the server with --env LEMMALOG_MCP_PATH=...".to_string()
             })?;
-            match state.memory.save(p) {
+            match store_save(&state.memory, p) {
                 Ok(_) => Ok(format!("saved to {p}")),
-                Err(e) => Err(format!("io: snapshot save failed: {e}")),
+                Err(e) => Err(format!("io: store save failed: {e}")),
             }
         }
         "lemmalog_run" => {
@@ -679,7 +741,7 @@ fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Res
         )
     {
         if let Some(p) = path {
-            let _ = state.memory.save(p);
+            let _ = store_save(&state.memory, p);
         }
     }
     Ok(json!({

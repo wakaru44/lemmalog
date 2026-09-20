@@ -17,8 +17,10 @@
 //! one writes at a time (sub-agent runs while the parent only reads),
 //! or have every writer use the CLI.
 //!
-//! Env: LEMMALOG_MCP_PATH (snapshot path; required for mutations,
-//! optional for fresh-session queries).
+//! Env: LEMMALOG_MCP_PATH (store path; required for mutations, optional
+//! for fresh-session queries). A `.db`, `.sqlite` or `.sqlite3` extension
+//! selects the SQLite store (needs the `sqlite` feature); anything else is
+//! the tab-separated snapshot.
 
 #![cfg(feature = "mcp")]
 
@@ -26,10 +28,66 @@ use lemmalog::agent::{AgentMemory, MockExtractor};
 use std::io::Read;
 
 fn snap_path() -> String {
-    std::env::var("LEMMALOG_MCP_PATH").unwrap_or_else(|_| {
-        eprintln!("lemmalog-cli: set LEMMALOG_MCP_PATH to the shared snapshot path");
+    let path = std::env::var("LEMMALOG_MCP_PATH").unwrap_or_else(|_| {
+        eprintln!("lemmalog-cli: set LEMMALOG_MCP_PATH to the shared store path");
         std::process::exit(2);
-    })
+    });
+    // Refuse before anything is opened: writing a snapshot into a file
+    // whose name promises SQLite is worse than not running at all.
+    if is_sqlite_store(&path) && !cfg!(feature = "sqlite") {
+        eprintln!(
+            "lemmalog-cli: {path:?} names a SQLite store but this binary was built without the \
+             `sqlite` feature.\n  rebuild: cargo build --release --features mcp,sqlite\n  or set \
+             LEMMALOG_MCP_PATH to a snapshot path (any extension but .db/.sqlite/.sqlite3)"
+        );
+        std::process::exit(2);
+    }
+    path
+}
+
+/// Which backend a store path selects: `.db`, `.sqlite` and `.sqlite3`
+/// mean SQLite, anything else the tab-separated snapshot. The path is the
+/// one knob an operator already sets, so it carries the choice — a second
+/// mode flag would only be another thing to keep in sync with it.
+///
+/// This helper and the two wrappers below are duplicated verbatim in
+/// `lemmalog-mcp.rs`. Sharing them would mean a new public module in
+/// `src/lib.rs`; for three stateless functions the duplicate is the
+/// narrower change (ADR 1).
+fn is_sqlite_store(path: &str) -> bool {
+    matches!(
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("db" | "sqlite" | "sqlite3")
+    )
+}
+
+/// Load from whichever backend the path names.
+///
+/// A missing `.db` is not an error: `storage::load` opens it and creates
+/// the schema (`CREATE TABLE IF NOT EXISTS`), so it reads back as an empty
+/// store — the same "start fresh" outcome a missing snapshot gets.
+fn store_load(path: &str) -> Result<AgentMemory<MockExtractor>, Box<dyn std::error::Error>> {
+    #[cfg(feature = "sqlite")]
+    if is_sqlite_store(path) {
+        return lemmalog::storage::load(MockExtractor::new(0.9), path);
+    }
+    AgentMemory::load(MockExtractor::new(0.9), path)
+}
+
+/// Persist to whichever backend the path names.
+fn store_save(
+    m: &AgentMemory<MockExtractor>,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "sqlite")]
+    if is_sqlite_store(path) {
+        return lemmalog::storage::save(m, path);
+    }
+    Ok(m.save(path)?)
 }
 
 /// Wall-clock seconds since the Unix epoch.
@@ -60,10 +118,10 @@ fn sync_clock(m: &mut AgentMemory<MockExtractor>) {
 }
 
 fn load(path: &str) -> AgentMemory<MockExtractor> {
-    let mut m = match AgentMemory::load(MockExtractor::new(0.9), path) {
+    let mut m = match store_load(path) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("lemmalog-cli: snapshot load failed ({e}); starting fresh");
+            eprintln!("lemmalog-cli: store load failed ({e}); starting fresh");
             AgentMemory::new(MockExtractor::new(0.9), "").expect("fresh memory")
         }
     };
@@ -100,7 +158,7 @@ fn main() {
             // backdated --ts would otherwise persist a past NOW.
             sync_clock(&mut m);
             let _ = m.maintain(m.engine.now);
-            m.save(&snap_path()).expect("save snapshot");
+            store_save(&m, &snap_path()).expect("save store");
             println!(
                 "added={} updated={} noop={} escalations={}",
                 report.added,
@@ -116,7 +174,7 @@ fn main() {
             let mut m = load(&snap_path());
             let text = stdin_or_flag(&args, "--facts");
             let (done, missing, died) = m.retract_facts(&text);
-            m.save(&snap_path()).expect("save snapshot");
+            store_save(&m, &snap_path()).expect("save store");
             println!("retracted {} fact(s)", done.len());
             if !died.is_empty() {
                 println!("{} derived fact(s) died:", died.len());
@@ -164,7 +222,7 @@ fn main() {
             match m.install_rules(&rules) {
                 Ok(id) => {
                     let n = m.maintain(m.engine.now);
-                    m.save(&snap_path()).expect("save snapshot");
+                    store_save(&m, &snap_path()).expect("save store");
                     println!("installed {id}; backfill derived +{n} facts");
                     for w in m.batch_conflicts(&id) {
                         println!("WARNING: {w}");
@@ -181,7 +239,7 @@ fn main() {
             let id = flag(&args, "--id").expect("--id <batch>");
             if m.uninstall_rules(&id) {
                 let _ = m.maintain(m.engine.now);
-                m.save(&snap_path()).expect("save snapshot");
+                store_save(&m, &snap_path()).expect("save store");
                 println!("uninstalled {id}; derivations reverted");
             } else {
                 eprintln!("no batch {id:?} (see: lemmalog-cli batches)");

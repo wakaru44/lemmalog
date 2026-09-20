@@ -72,6 +72,10 @@ impl RetractReason {
 pub const RETRACT_PROV: &str = "retract:";
 pub const RETRACTED_AT_PROV: &str = "retracted_at:";
 pub const RETRACTED_BY_PROV: &str = "retracted_by:";
+/// Stamped by [`AgentMemory::reverify`]: the instant a fact was checked
+/// against current reality at confidence 1.0. Rides the same provenance set
+/// as the retraction markers, and is what clears `suspect`.
+pub const VERIFIED_PROV: &str = "verified:";
 
 /// Provenance is joined with commas by the snapshot format, so a comma in
 /// a caller-supplied retractor name would split into two prov entries.
@@ -379,6 +383,23 @@ pub struct IngestReport {
     pub escalations: Vec<String>,
 }
 
+/// One entry of the re-verification queue: a fact that is neither true nor
+/// false but UNVERIFIED — something it rests on stopped being true because
+/// the world moved on, so it was right for the earlier period and nobody has
+/// checked it against current reality since.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuspectFact {
+    /// The suspect fact, as the line protocol renders it (or `pred(args)`
+    /// for a fact derived by an installed rule).
+    pub fact: String,
+    /// The edge whose closure put it here.
+    pub closed_support: String,
+    /// The instant that edge stopped being true.
+    pub closed_at: i64,
+    /// The proof tree, from `why()`.
+    pub why: String,
+}
+
 /// Agent memory facade: engine + extraction + episodes + escalations.
 pub struct AgentMemory<X: Extractor> {
     pub engine: Engine,
@@ -401,6 +422,24 @@ pub const DEFAULT_RULES: &str = "\
 current(E,R,O) :- edge(E,R,O,VF,VT,_), now(T), VF =< T, T < VT.
 # curated exclusivity table for the update policy
 exclusive(\"works_at\").
+# --- the third fact state: suspect -------------------------------------
+# An edge closed in valid time because the WORLD CHANGED was true until T,
+# so what rested on it was CORRECT for the earlier period and is merely
+# unverified against current reality now -- neither true nor false, but a
+# re-verification queue. (An edge retracted as `wrong` was never true: it
+# is deleted and its dependents die. That is a different thing entirely.)
+# `retracted_edge/5`, `edge_evidence/4` and `reverified/4` are base facts
+# lifted out of the `edge` provenance markers by `lift_retraction_markers`,
+# because the rule language reads arguments, not annotations.
+closed_by_world_change(E,R,O,T) :- retracted_edge(E,R,O,T,\"world_changed\").
+# the closed fact itself heads the queue: its last known state is the first
+# thing to go and re-check
+suspect(E,R,O,E,R,O,T) :- closed_by_world_change(E,R,O,T), !cleared(E,R,O,T).
+# anything still current that rests on the same observation as the closed
+# fact: right for the earlier period, unverified now
+suspect(S,P,V,E,R,O,T) :- closed_by_world_change(E,R,O,T), edge_evidence(E,R,O,Ep), edge_evidence(S,P,V,Ep), current(S,P,V), !cleared(S,P,V,T).
+# re-assertion at confidence 1.0 AFTER the closure is what clears suspicion
+cleared(S,P,V,T) :- reverified(S,P,V,VT), closed_by_world_change(_,_,_,T), T =< VT.
 ";
 
 impl<X: Extractor> AgentMemory<X> {
@@ -582,6 +621,27 @@ impl<X: Extractor> AgentMemory<X> {
                 self.engine.retract("edge", old);
                 self.engine.declare("edge", &closed, ann);
             }
+            // Supersession IS a retraction, so it must leave the same trace as
+            // one: `retract_facts_because` records the reason in the `retract:*`
+            // provenance markers that `storage` lifts into the `retract_reason`
+            // / `retracted_at` columns. Without this the same event lands as
+            // `retract_reason = NULL` here and `'superseded'` there.
+            // `declare` lattice-merges (max confidence, union of provenance),
+            // so a zero-confidence annotation stamps the markers on the row the
+            // loop above just wrote without disturbing its confidence.
+            let at = self.engine.now;
+            let marks = Ann::base(
+                0.0,
+                [
+                    format!("{RETRACT_PROV}{}", RetractReason::Superseded.as_str()),
+                    format!("{RETRACTED_AT_PROV}{at}"),
+                ],
+            );
+            for old in &open {
+                let mut closed = old.clone();
+                closed[4] = Value::Int(at);
+                self.engine.declare("edge", &closed, marks.clone());
+            }
             self.assert_open(&[subj, pred, obj], c.confidence, &ep.id);
             report.updated += 1;
         } else if multi {
@@ -623,8 +683,235 @@ impl<X: Extractor> AgentMemory<X> {
     /// can report this turn's changes ("what's new in memory").
     pub fn maintain(&mut self, now: i64) -> usize {
         self.engine.set_now(now);
+        self.lift_retraction_markers();
         self.last_turn_epoch = self.engine.epoch();
         self.engine.run()
+    }
+
+    /// Lift the retraction / verification / episode markers of `edge` rows
+    /// out of the provenance set and into base facts the rule language can
+    /// join on: `retracted_edge(S,P,O,ClosedAt,"world_changed")`,
+    /// `edge_evidence(S,P,O,Episode)` and `reverified(S,P,O,At)`.
+    ///
+    /// Provenance is an annotation, not an argument, so no rule can read it
+    /// — this is the bridge, and it is the same marker/column mapping
+    /// `storage` already relies on, so it survives a round-trip either way.
+    /// Rebuilt (not accumulated) on every `maintain`: rows no longer
+    /// justified by a marker are retracted first.
+    ///
+    /// `edge_evidence` is emitted ONLY for observations a world-change
+    /// closure actually touches. A store with no `world_changed` retraction
+    /// therefore gains nothing at all, and the `suspect` join stays
+    /// proportional to what was invalidated rather than to the whole store.
+    // ponytail: linear scan of `edge` per maintain, same shape as the
+    // supersession scan above; an index belongs upstream in `eval`, not here.
+    fn lift_retraction_markers(&mut self) {
+        let wc_marker = format!("{RETRACT_PROV}{}", RetractReason::WorldChanged.as_str());
+        // (spo, valid_to, closed-by-world-change, episodes, verified-ats)
+        type Lifted = (Vec<Value>, i64, bool, Vec<String>, Vec<i64>);
+        let lifted: Vec<Lifted> = match self.engine.relations.get("edge") {
+            None => Vec::new(),
+            Some(rel) => rel
+                .rows
+                .iter()
+                .filter(|row| row.key.len() == 6)
+                .map(|row| {
+                    let prov = &row.fact.ann.prov;
+                    let vt = row.key[4].as_int().unwrap_or(i64::MAX);
+                    (
+                        row.key[..3].to_vec(),
+                        vt,
+                        vt != i64::MAX && prov.contains(&wc_marker),
+                        // an episode id is a bare provenance entry: every
+                        // marker this file writes is `name:value`, and
+                        // `superseded` is the one legacy bare non-episode
+                        prov.iter()
+                            .filter(|p| !p.contains(':') && p.as_str() != "superseded")
+                            .cloned()
+                            .collect(),
+                        prov.iter()
+                            .filter_map(|p| p.strip_prefix(VERIFIED_PROV))
+                            .filter_map(|v| v.parse::<i64>().ok())
+                            .collect(),
+                    )
+                })
+                .collect(),
+        };
+        let stale: std::collections::BTreeSet<&String> = lifted
+            .iter()
+            .filter(|(_, _, wc, _, _)| *wc)
+            .flat_map(|(_, _, _, eps, _)| eps)
+            .collect();
+        let world_changed = self.engine.sym("world_changed");
+        let mut want: HashMap<&str, std::collections::BTreeSet<Vec<Value>>> = HashMap::new();
+        for (spo, vt, wc, eps, vers) in &lifted {
+            if *wc {
+                let mut k = spo.clone();
+                k.push(Value::Int(*vt));
+                k.push(world_changed);
+                want.entry("retracted_edge").or_default().insert(k);
+            }
+            for ep in eps.iter().filter(|e| stale.contains(e)) {
+                let sym = self.engine.sym(ep);
+                let mut k = spo.clone();
+                k.push(sym);
+                want.entry("edge_evidence").or_default().insert(k);
+            }
+            for at in vers {
+                let mut k = spo.clone();
+                k.push(Value::Int(*at));
+                want.entry("reverified").or_default().insert(k);
+            }
+        }
+        for pred in ["retracted_edge", "edge_evidence", "reverified"] {
+            let want = want.remove(pred).unwrap_or_default();
+            for stale_key in self
+                .engine
+                .relation_keys(pred)
+                .into_iter()
+                .filter(|k| !want.contains(k))
+                .collect::<Vec<_>>()
+            {
+                self.engine.retract(pred, &stale_key);
+            }
+            for k in want {
+                self.engine.declare(pred, &k, Ann::unit());
+            }
+        }
+    }
+
+    /// The re-verification queue: every fact currently `suspect`, with the
+    /// closed edge that made it suspect and the proof tree behind it.
+    ///
+    /// Two populations, one queue: the `suspect/7` rows the rules derive
+    /// (the closed fact itself, plus facts still current on the same
+    /// observation), and facts derived by INSTALLED rules whose provenance
+    /// carries one of the invalidated observations — those the semiring
+    /// already tracks, since a rule body unions the provenance of what it
+    /// read. Sorted by closure instant, then by fact.
+    pub fn reverification_queue(&self) -> Vec<SuspectFact> {
+        let render = |k: &[Value]| -> String {
+            format!(
+                "{} --{}--> {}",
+                self.engine.interner.display(&k[0]),
+                self.engine.interner.display(&k[1]),
+                self.engine.interner.display(&k[2])
+            )
+        };
+        let mut out: Vec<SuspectFact> = self
+            .engine
+            .query("suspect", &[None, None, None, None, None, None, None])
+            .into_iter()
+            .filter(|(k, _)| k.len() == 7)
+            .map(|(k, _)| SuspectFact {
+                fact: render(&k[..3]),
+                closed_support: render(&k[3..6]),
+                closed_at: k[6].as_int().unwrap_or_default(),
+                why: self.engine.why("suspect", &k),
+            })
+            .collect();
+
+        // episode -> the world-changed edge that invalidated it
+        let wc_marker = format!("{RETRACT_PROV}{}", RetractReason::WorldChanged.as_str());
+        let mut stale: HashMap<String, (String, i64)> = HashMap::new();
+        if let Some(rel) = self.engine.relations.get("edge") {
+            for row in rel.rows.iter().filter(|r| r.key.len() == 6) {
+                let vt = row.key[4].as_int().unwrap_or(i64::MAX);
+                if vt == i64::MAX || !row.fact.ann.prov.contains(&wc_marker) {
+                    continue;
+                }
+                for ep in row.fact.ann.prov.iter().filter(|p| !p.contains(':')) {
+                    stale.insert(ep.clone(), (render(&row.key[..3]), vt));
+                }
+            }
+        }
+        if !stale.is_empty() {
+            // the machinery's own relations are not answers about the world
+            const INTERNAL: [&str; 7] = [
+                "edge",
+                "current",
+                "suspect",
+                "cleared",
+                "closed_by_world_change",
+                "retracted_edge",
+                "reverified",
+            ];
+            for (pred, rel) in self.engine.relations_iter() {
+                if INTERNAL.contains(&pred.as_str())
+                    || !self.engine.clauses.iter().any(|c| c.head.pred == *pred)
+                {
+                    continue;
+                }
+                for row in &rel.rows {
+                    let Some((support, at)) = row
+                        .fact
+                        .ann
+                        .prov
+                        .iter()
+                        .find_map(|p| stale.get(p).cloned())
+                    else {
+                        continue;
+                    };
+                    out.push(SuspectFact {
+                        fact: self.engine.render_fact(pred, &row.key),
+                        closed_support: support,
+                        closed_at: at,
+                        why: self.engine.why(pred, &row.key),
+                    });
+                }
+            }
+        }
+        out.sort_by(|a, b| (a.closed_at, &a.fact).cmp(&(b.closed_at, &b.fact)));
+        out
+    }
+
+    /// Clear suspicion by re-verifying facts against current reality: each
+    /// matching open edge is re-asserted at confidence 1.0 and stamped with
+    /// `verified:<at>`, which the `cleared` rule reads. Returns
+    /// (re-verified lines, not-found lines).
+    ///
+    /// **The bar this call asserts, which the engine does not enforce:** an
+    /// agent may clear a suspect fact on its own ONLY at confidence 1.0 and
+    /// only on evidence it has just re-read at current HEAD. Anything
+    /// inferred, remembered, or carried over from the observation that is
+    /// already under suspicion goes to a human instead. Who is allowed to
+    /// call this is the agent protocol's business, not the engine's.
+    pub fn reverify(&mut self, text: &str, at: i64) -> (Vec<String>, Vec<String>) {
+        self.engine.set_now(at);
+        let mut done = Vec::new();
+        let mut missing = Vec::new();
+        for c in &parse_protocol_strict(text, 1.0) {
+            let subj = self.engine.sym(&c.subj);
+            let pred = self.engine.sym(&c.pred);
+            let obj = match c.obj.parse::<i64>() {
+                Ok(n) => Value::Int(n),
+                Err(_) => self.engine.sym(&c.obj),
+            };
+            let open: Vec<Vec<Value>> = self
+                .engine
+                .query(
+                    "edge",
+                    &[Some(subj), Some(pred), Some(obj), None, None, None],
+                )
+                .into_iter()
+                .map(|(k, _)| k)
+                .filter(|k| matches!(k[4].as_int(), Some(vt) if vt == i64::MAX))
+                .collect();
+            let line = format!("{} --{}--> {}", c.subj, c.pred, c.obj);
+            if open.is_empty() {
+                missing.push(line);
+                continue;
+            }
+            for row in &open {
+                // `declare` is a lattice merge: confidence goes to 1.0, the
+                // original episodes stay answerable, the marker is added.
+                self.engine
+                    .declare("edge", row, Ann::base(1.0, [format!("{VERIFIED_PROV}{at}")]));
+            }
+            done.push(line);
+        }
+        self.maintain(at);
+        (done, missing)
     }
 
     pub fn escalations(&self) -> &[String] {
@@ -1484,6 +1771,245 @@ mod retract_reason_tests {
         assert!(
             died.iter().any(|d| d.contains("held_at_150")),
             "the dead dependent must be reported: {died:?}"
+        );
+    }
+
+    /// `apply_update` closing an exclusive relation's previous value is the
+    /// same event as a `Superseded` retraction, so the closed row must carry
+    /// the same three things: the original confidence, the original episode,
+    /// and the retraction markers `storage` maps to the `edges` columns.
+    #[test]
+    fn apply_update_supersession_keeps_provenance_and_stamps_the_markers() {
+        let mut m = AgentMemory::new(MockExtractor::new(0.9), "").expect("new memory");
+        // `status` is functional, so the second observation supersedes the first
+        m.observe_extracted("alice --status[0.42]--> active", 100);
+        m.observe_extracted("alice --status[0.8]--> away", 200);
+
+        let closed: Vec<_> = m.engine.relations["edge"]
+            .rows
+            .iter()
+            .filter(|r| r.key[4] == Value::Int(200))
+            .collect();
+        assert_eq!(closed.len(), 1, "exactly one row closed at `now`");
+        let ann = &closed[0].fact.ann;
+
+        assert!(
+            (ann.conf - 0.42).abs() < 1e-9,
+            "original confidence survives, not a hardcoded 0.9: {}",
+            ann.conf
+        );
+        assert!(
+            ann.prov.contains("ep1"),
+            "the asserting episode is still answerable: {:?}",
+            ann.prov
+        );
+        assert!(ann.prov.contains("superseded"), "{:?}", ann.prov);
+        assert!(ann.prov.contains("retract:superseded"), "{:?}", ann.prov);
+        assert!(ann.prov.contains("retracted_at:200"), "{:?}", ann.prov);
+    }
+}
+
+#[cfg(test)]
+mod suspect_tests {
+    use super::*;
+
+    /// One observation asserting two facts (so one of them can be closed
+    /// while the other stays current on the same evidence), an unrelated
+    /// observation, and a rule that derives from the edge INTERVAL rather
+    /// than from the clock — the only kind of derivation that outlives a
+    /// closed valid_to, and therefore the only one that can be suspect
+    /// rather than simply dead.
+    fn memory() -> AgentMemory<MockExtractor> {
+        let mut m = AgentMemory::new(
+            MockExtractor::new(0.9),
+            "held_at_150(E,R,O) :- edge(E,R,O,VF,VT,_), VF =< 150, 150 < VT.",
+        )
+        .expect("new memory");
+        m.observe_extracted(
+            "alice --lives_in--> berlin\n\
+             alice --manager--> bob",
+            100,
+        );
+        m.observe_extracted("carol --lives_in--> paris", 110);
+        m.maintain(120);
+        assert!(
+            m.reverification_queue().is_empty(),
+            "nothing is suspect before anything is retracted"
+        );
+        m
+    }
+
+    fn close_as_world_changed(m: &mut AgentMemory<MockExtractor>) {
+        m.engine.set_now(200);
+        let (done, missing, _) = m.retract_facts_because(
+            "alice --lives_in--> berlin",
+            RetractReason::WorldChanged,
+            Some("agent-7"),
+        );
+        assert_eq!(done.len(), 1, "fixture retraction must land");
+        assert!(missing.is_empty());
+    }
+
+    fn facts(q: &[SuspectFact]) -> Vec<String> {
+        q.iter().map(|s| s.fact.clone()).collect()
+    }
+
+    /// (a) A fact DERIVED from an edge closed as `world_changed` is suspect,
+    /// and so is a fact that merely rests on the same observation.
+    #[test]
+    fn world_change_makes_dependents_suspect() {
+        let mut m = memory();
+        close_as_world_changed(&mut m);
+        let q = m.reverification_queue();
+        let f = facts(&q);
+        assert!(
+            f.contains(&"held_at_150(alice, lives_in, berlin)".to_string()),
+            "the derived fact must be queued for re-verification: {f:?}"
+        );
+        assert!(
+            f.contains(&"alice --lives_in--> berlin".to_string()),
+            "the closed fact itself heads the queue: {f:?}"
+        );
+        assert!(
+            f.contains(&"alice --manager--> bob".to_string()),
+            "a current fact on the same observation is unverified too: {f:?}"
+        );
+        let entry = q.iter().find(|s| s.fact == "alice --manager--> bob").unwrap();
+        assert_eq!(entry.closed_support, "alice --lives_in--> berlin");
+        assert_eq!(entry.closed_at, 200, "the instant the world changed");
+        assert!(
+            entry.why.contains("closed_by_world_change"),
+            "the queue must say WHY, from why(): {}",
+            entry.why
+        );
+    }
+
+    /// (b) The same fact retracted as `wrong` was never true: its dependents
+    /// die instead of becoming suspect. Suspicion is not a softer retraction.
+    #[test]
+    fn wrong_retraction_kills_instead_of_suspecting() {
+        let mut m = memory();
+        m.engine.set_now(200);
+        let (done, _, died) = m.retract_facts("alice --lives_in--> berlin");
+        assert_eq!(done.len(), 1);
+        assert!(
+            died.iter().any(|d| d.contains("held_at_150")),
+            "the dependent of a never-true fact must die: {died:?}"
+        );
+        assert!(
+            m.engine.relation_keys("held_at_150").len() == 2,
+            "only the two dependents of the surviving edges remain"
+        );
+        assert!(
+            m.reverification_queue().is_empty(),
+            "nothing is suspect: a wrong fact leaves nothing to re-verify"
+        );
+    }
+
+    /// (c) No false positives: facts with no closed support are untouched.
+    #[test]
+    fn facts_without_a_closed_support_are_not_suspect() {
+        let mut m = memory();
+        close_as_world_changed(&mut m);
+        let f = facts(&m.reverification_queue());
+        assert!(
+            !f.iter().any(|s| s.contains("carol") || s.contains("paris")),
+            "the unrelated observation must not be queued: {f:?}"
+        );
+        assert!(
+            !f.is_empty(),
+            "guard: the queue must be non-empty for this to mean anything"
+        );
+    }
+
+    /// (d) A suspect fact is not deleted: it stays queryable, and what it
+    /// was true for in the earlier period is intact.
+    #[test]
+    fn a_suspect_fact_keeps_its_earlier_period_truth() {
+        let mut m = memory();
+        close_as_world_changed(&mut m);
+        assert_eq!(
+            m.engine.relation_keys("held_at_150").len(),
+            3,
+            "every earlier-period derivation survives the closure"
+        );
+        assert_eq!(
+            m.ask("current(alice, \"manager\", bob)")
+                .expect("query")
+                .len(),
+            1,
+            "a suspect fact is still current: suspicion is not retraction"
+        );
+        let edges = m.engine.relation_keys("edge");
+        assert!(
+            edges
+                .iter()
+                .any(|k| k[4] == Value::Int(200) && k[1] == m.engine.sym("lives_in")),
+            "the closed edge row survives with its valid_to"
+        );
+        assert_eq!(
+            m.ask("suspect(alice, \"manager\", bob, E, R, O, T)")
+                .expect("query")
+                .len(),
+            1,
+            "and the suspicion is itself a queryable fact"
+        );
+    }
+
+    /// (e) Re-assertion at confidence 1.0 clears the suspicion.
+    #[test]
+    fn reverification_at_full_confidence_clears_the_suspicion() {
+        let mut m = memory();
+        close_as_world_changed(&mut m);
+        assert!(facts(&m.reverification_queue()).contains(&"alice --manager--> bob".to_string()));
+
+        let (done, missing) = m.reverify("alice --manager--> bob", 300);
+        assert_eq!(done.len(), 1, "the fact must be found and re-verified");
+        assert!(missing.is_empty());
+
+        assert!(
+            !facts(&m.reverification_queue()).contains(&"alice --manager--> bob".to_string()),
+            "a fact checked against current reality leaves the queue"
+        );
+        let (alice, manager) = (m.engine.sym("alice"), m.engine.sym("manager"));
+        let edge = m
+            .engine
+            .query("edge", &[Some(alice), Some(manager), None, None, None, None])
+            .into_iter()
+            .next()
+            .expect("the manager edge");
+        assert_eq!(edge.1.conf, 1.0, "re-verification is a 1.0 assertion");
+        assert!(
+            edge.1.prov.contains("ep1") && edge.1.prov.contains("verified:300"),
+            "the original evidence stays answerable next to the check: {:?}",
+            edge.1.prov
+        );
+        assert!(
+            facts(&m.reverification_queue()).contains(&"alice --lives_in--> berlin".to_string()),
+            "clearing one fact must not clear the rest of the queue"
+        );
+    }
+
+    /// The new rules must not disturb the temporal projection: `current/3`
+    /// is what every other view in the system reads.
+    #[test]
+    fn current_is_unchanged_for_facts_without_closed_supports() {
+        let mut m = memory();
+        let before = m.ask("current(E, R, O)").expect("current");
+        close_as_world_changed(&mut m);
+        let after = m.ask("current(E, R, O)").expect("current");
+        assert_eq!(
+            before.len(),
+            3,
+            "fixture must hold three current facts: {before:?}"
+        );
+        assert_eq!(after.len(), 2, "only the closed edge leaves current/3");
+        for row in &after {
+            assert!(before.contains(row), "current/3 gained a row: {row}");
+        }
+        assert!(
+            after.iter().any(|r| r.contains("carol")) && after.iter().any(|r| r.contains("bob")),
+            "untouched facts stay current verbatim: {after:?}"
         );
     }
 }
