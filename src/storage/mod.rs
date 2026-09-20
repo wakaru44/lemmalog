@@ -13,8 +13,8 @@
 //! `fact_prov`. The schema is `src/storage/schema.sql`.
 
 use crate::agent::{
-    AgentMemory, Episode, Extractor, RetractReason, BOOTSTRAP_BATCH, RETRACTED_AT_PROV,
-    RETRACTED_BY_PROV, RETRACT_PROV,
+    AgentMemory, AssertionContext, Episode, Extractor, FactClass, RetractReason, BOOTSTRAP_BATCH,
+    BOUNDED_BY_PROV, RETRACTED_AT_PROV, RETRACTED_BY_PROV, RETRACT_PROV,
 };
 use crate::eval::Ann;
 use crate::intern::{Sym, Value};
@@ -24,8 +24,9 @@ const SCHEMA: &str = include_str!("schema.sql");
 
 /// Shape of `schema.sql`. Bump on any change that makes a store written by
 /// an older binary unreadable — there is no migration path, so `load`
-/// refuses a mismatch instead of guessing. v2 added `episodes.ord`.
-const SCHEMA_VERSION: u32 = 2;
+/// refuses a mismatch instead of guessing. v2 added `episodes.ord`; v3
+/// added `episodes.sha`, `.branch` and `.fact_class` (ADR 3).
+const SCHEMA_VERSION: u32 = 3;
 
 /// The version a store without a `schema_version` key was written at: the
 /// key did not exist before v2, so its absence pins the store to v1.
@@ -61,12 +62,12 @@ fn as_edge(key: &[Value]) -> Option<([Sym; 2], Value, [i64; 3])> {
     Some(([*s, *p], *o, [*vf, *vt, *at]))
 }
 
-/// Split a provenance set into (real provenance, retraction columns).
-/// The markers are written to `edges` columns instead of `edge_prov`;
-/// [`Retraction::markers`] puts them back on load.
-fn split_retraction(prov: &std::collections::BTreeSet<String>) -> (Vec<&str>, Retraction) {
+/// Split a provenance set into (real provenance, `edges` columns). The
+/// markers are written to columns instead of `edge_prov`;
+/// [`EdgeCols::markers`] puts them back on load.
+fn split_markers(prov: &std::collections::BTreeSet<String>) -> (Vec<&str>, EdgeCols) {
     let mut keep = Vec::new();
-    let mut r = Retraction::default();
+    let mut r = EdgeCols::default();
     for p in prov {
         if let Some(v) = p.strip_prefix(RETRACT_PROV) {
             r.reason = RetractReason::parse(v).map(|x| x.as_str().to_string());
@@ -74,6 +75,8 @@ fn split_retraction(prov: &std::collections::BTreeSet<String>) -> (Vec<&str>, Re
             r.at = v.parse().ok();
         } else if let Some(v) = p.strip_prefix(RETRACTED_BY_PROV) {
             r.by = Some(v.to_string());
+        } else if let Some(v) = p.strip_prefix(BOUNDED_BY_PROV) {
+            r.bounded_by = Some(v.to_string());
         } else {
             keep.push(p.as_str());
         }
@@ -81,18 +84,25 @@ fn split_retraction(prov: &std::collections::BTreeSet<String>) -> (Vec<&str>, Re
     (keep, r)
 }
 
+/// The `edges` columns that ride the provenance set in memory: the three
+/// retraction markers, plus how far back the search that produced a
+/// `valid_from = i64::MIN` edge could actually look.
 #[derive(Default)]
-struct Retraction {
+struct EdgeCols {
     reason: Option<String>,
     at: Option<i64>,
     by: Option<String>,
+    bounded_by: Option<String>,
 }
 
-impl Retraction {
+impl EdgeCols {
     /// The provenance markers these columns stand for — the inverse of
-    /// [`split_retraction`].
+    /// [`split_markers`].
     fn markers(&self) -> Vec<String> {
         let mut out = Vec::new();
+        if let Some(b) = &self.bounded_by {
+            out.push(format!("{BOUNDED_BY_PROV}{b}"));
+        }
         if let Some(r) = &self.reason {
             out.push(format!("{RETRACT_PROV}{r}"));
         }
@@ -170,10 +180,22 @@ pub fn save<X: Extractor>(m: &AgentMemory<X>, path: &str) -> Res<()> {
             ord += 1;
         }
 
-        let mut ep = tx
-            .prepare("INSERT INTO episodes (ord, id, ts, speaker, text) VALUES (?1,?2,?3,?4,?5)")?;
+        let mut ep = tx.prepare(
+            "INSERT INTO episodes (ord, id, ts, speaker, text, sha, branch, fact_class) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        )?;
         for (i, e) in m.episodes.iter().enumerate() {
-            ep.execute(params![i as i64, e.id, e.ts, e.speaker, e.text])?;
+            let c = m.episode_context(&e.id);
+            ep.execute(params![
+                i as i64,
+                e.id,
+                e.ts,
+                e.speaker,
+                e.text,
+                c.sha,
+                c.branch,
+                c.class.as_str()
+            ])?;
         }
 
         let mut esc = tx.prepare("INSERT INTO escalations (id, text) VALUES (?1, ?2)")?;
@@ -184,8 +206,9 @@ pub fn save<X: Extractor>(m: &AgentMemory<X>, path: &str) -> Res<()> {
         let mut edge = tx.prepare(
             "INSERT INTO edges (subject, predicate, object_kind, object, object_int, \
              valid_from, valid_to, asserted_at, confidence, \
-             retract_reason, retracted_at, retracted_by) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+             retract_reason, retracted_at, retracted_by, bounded_by, \
+             asserted_at_sha, asserted_on_branch, fact_class) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
         )?;
         let mut edge_prov = tx.prepare("INSERT INTO edge_prov (edge_id, prov) VALUES (?1, ?2)")?;
         let mut fact = tx.prepare(
@@ -215,7 +238,21 @@ pub fn save<X: Extractor>(m: &AgentMemory<X>, path: &str) -> Res<()> {
                             ),
                             Value::Int(i) => ("int", None, Some(i)),
                         };
-                        let (prov_keep, r) = split_retraction(&ann.prov);
+                        let (prov_keep, r) = split_markers(&ann.prov);
+                        // Denormalised from the episode that asserted it,
+                        // so the common query ("what did branch X claim?")
+                        // is one indexable predicate and no join. The
+                        // provenance set IS the set of episode ids; the
+                        // first one we hold a context for wins, and a
+                        // fact whose episodes are all unstamped (or gone)
+                        // falls back to the default — NULL sha, NULL
+                        // branch, fact_class 'agent' — which is exactly
+                        // what an unstamped ingestion stores anyway.
+                        let c = prov_keep
+                            .iter()
+                            .find_map(|id| m.episode_ctx.get(*id))
+                            .cloned()
+                            .unwrap_or_default();
                         edge.execute(params![
                             s,
                             p,
@@ -228,7 +265,11 @@ pub fn save<X: Extractor>(m: &AgentMemory<X>, path: &str) -> Res<()> {
                             ann.conf,
                             r.reason,
                             r.at,
-                            r.by
+                            r.by,
+                            r.bounded_by,
+                            c.sha,
+                            c.branch,
+                            c.class.as_str()
                         ])?;
                         let id = tx.last_insert_rowid();
                         for prov in prov_keep {
@@ -326,17 +367,40 @@ pub fn load<X: Extractor>(extractor: X, path: &str) -> Res<AgentMemory<X>> {
     // `ord` is the in-memory Vec index: episode ids are positional, so the
     // original insertion order is the only correct one. (ts, id) is not a
     // substitute — one turn's facts share a ts, and `ep10` < `ep2` as TEXT.
-    let episodes: Vec<Episode> = conn
-        .prepare("SELECT id, ts, speaker, text FROM episodes ORDER BY ord")?
+    //
+    // The episode is the source of truth for the assertion context: the
+    // same columns on `edges` are a denormalised copy for SQL queries and
+    // are deliberately NOT read back here.
+    let mut episode_ctx: std::collections::HashMap<String, AssertionContext> =
+        std::collections::HashMap::new();
+    let mut episodes: Vec<Episode> = Vec::new();
+    for row in conn
+        .prepare("SELECT id, ts, speaker, text, sha, branch, fact_class FROM episodes ORDER BY ord")?
         .query_map([], |r| {
-            Ok(Episode {
-                id: r.get(0)?,
-                ts: r.get(1)?,
-                speaker: r.get(2)?,
-                text: r.get(3)?,
-            })
+            Ok((
+                Episode {
+                    id: r.get(0)?,
+                    ts: r.get(1)?,
+                    speaker: r.get(2)?,
+                    text: r.get(3)?,
+                },
+                AssertionContext {
+                    sha: r.get(4)?,
+                    branch: r.get(5)?,
+                    // The CHECK constraint makes anything else
+                    // unwritable; a store hand-edited past it reads as
+                    // the default rather than failing the whole load.
+                    class: FactClass::parse(&r.get::<_, String>(6)?).unwrap_or_default(),
+                },
+            ))
         })?
-        .collect::<Result<_, _>>()?;
+    {
+        let (e, ctx) = row?;
+        if ctx != AssertionContext::default() {
+            episode_ctx.insert(e.id.clone(), ctx);
+        }
+        episodes.push(e);
+    }
 
     let escalations: Vec<String> = conn
         .prepare("SELECT text FROM escalations ORDER BY id")?
@@ -351,7 +415,7 @@ pub fn load<X: Extractor>(extractor: X, path: &str) -> Res<AgentMemory<X>> {
         .prepare(
             "SELECT id, subject, predicate, object_kind, object, object_int, \
              valid_from, valid_to, asserted_at, confidence, \
-             retract_reason, retracted_at, retracted_by FROM edges ORDER BY id",
+             retract_reason, retracted_at, retracted_by, bounded_by FROM edges ORDER BY id",
         )?
         .query_map([], |r| {
             let obj = if r.get::<_, String>(3)? == "sym" {
@@ -370,17 +434,18 @@ pub fn load<X: Extractor>(extractor: X, path: &str) -> Res<AgentMemory<X>> {
                     (false, String::new(), r.get::<_, i64>(8)?),
                 ],
                 r.get::<_, f64>(9)?,
-                Retraction {
+                EdgeCols {
                     reason: r.get::<_, Option<String>>(10)?,
                     at: r.get::<_, Option<i64>>(11)?,
                     by: r.get::<_, Option<String>>(12)?,
+                    bounded_by: r.get::<_, Option<String>>(13)?,
                 },
             ))
         })?
     {
-        let (id, args, conf, retraction) = row?;
+        let (id, args, conf, cols) = row?;
         let mut p = prov(&conn, "edge_prov", "edge_id", id)?;
-        p.extend(retraction.markers());
+        p.extend(cols.markers());
         facts.push(("edge".to_string(), conf, p, args));
     }
 
@@ -422,6 +487,7 @@ pub fn load<X: Extractor>(extractor: X, path: &str) -> Res<AgentMemory<X>> {
     };
     m.escalations = escalations;
     m.episodes = episodes;
+    m.episode_ctx = episode_ctx;
     m.episode_counter = m.episodes.len() as u64;
     for (pred, conf, prov, args) in facts {
         let resolved: Vec<Value> = args
@@ -880,6 +946,195 @@ mod tests {
             .map(|x| x.len())
             .unwrap_or(0);
         assert_eq!(wal_len, 0, "a refused save writes nothing, so nothing to fold in");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// (sha, branch, fact_class) of every edge, ordered by subject, read
+    /// back out of SQL — the columns exist to be queried that way, so the
+    /// tests query them that way rather than trusting the in-memory side.
+    fn edge_context_rows(path: &str) -> Vec<(Option<String>, Option<String>, String)> {
+        let conn = Connection::open(path).unwrap();
+        let mut q = conn
+            .prepare(
+                "SELECT asserted_at_sha, asserted_on_branch, fact_class FROM edges \
+                 ORDER BY subject",
+            )
+            .unwrap();
+        let rows = q
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+
+    /// (a) Nothing set: the ADR-3 columns stay NULL and the class is the
+    /// default, on the episode and on the edge alike. This is the shape
+    /// every store written before the feature existed has.
+    #[test]
+    fn without_an_assertion_context_the_columns_are_null() {
+        let path = scratch("ctx-unset.db");
+        let mut m = AgentMemory::new(MockExtractor::new(0.9), "").unwrap();
+        m.observe_extracted("alice --lives_in--> berlin", 100);
+        m.maintain(100);
+        assert_eq!(m.assertion_context(), &AssertionContext::default());
+        save(&m, &path).unwrap();
+
+        assert_eq!(edge_context_rows(&path), vec![(None, None, "agent".into())]);
+        let conn = Connection::open(&path).unwrap();
+        let ep: (Option<String>, Option<String>, String) = conn
+            .query_row("SELECT sha, branch, fact_class FROM episodes", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(ep, (None, None, "agent".to_string()));
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// (b) With a context set, the episode carries it AND the edge row
+    /// carries the denormalised copy — the copy is the whole point, since
+    /// it is what makes `WHERE asserted_on_branch = ?` a join-free query.
+    #[test]
+    fn a_set_context_reaches_the_episode_and_the_edge_row() {
+        let path = scratch("ctx-set.db");
+        let mut m = AgentMemory::new(MockExtractor::new(0.9), "").unwrap();
+        m.set_assertion_context(Some("cafe1234"), Some("main"), Some("human"))
+            .unwrap();
+        m.observe_extracted("alice --lives_in--> berlin", 100);
+        m.maintain(100);
+        save(&m, &path).unwrap();
+
+        let ctx = m.episode_context("ep1");
+        assert_eq!(ctx.sha.as_deref(), Some("cafe1234"));
+        assert_eq!(ctx.branch.as_deref(), Some("main"));
+        assert_eq!(ctx.class, FactClass::Human);
+
+        assert_eq!(
+            edge_context_rows(&path),
+            vec![(Some("cafe1234".into()), Some("main".into()), "human".into())],
+            "the edge row must carry the episode's context, denormalised"
+        );
+        let conn = Connection::open(&path).unwrap();
+        let ep: (Option<String>, String) = conn
+            .query_row("SELECT sha, fact_class FROM episodes", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(ep, (Some("cafe1234".to_string()), "human".to_string()));
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// (c) Two ingestions under two contexts: the sha follows the EPISODE
+    /// that asserted each edge, not the memory. A global "last context
+    /// wins" implementation gives both edges the same sha and fails here.
+    #[test]
+    fn each_episode_keeps_the_context_it_was_ingested_under() {
+        let path = scratch("ctx-per-episode.db");
+        let mut m = AgentMemory::new(MockExtractor::new(0.9), "").unwrap();
+        m.set_assertion_context(Some("aaaa1111"), Some("main"), None)
+            .unwrap();
+        m.observe_extracted("alice --lives_in--> berlin", 100);
+        m.set_assertion_context(Some("bbbb2222"), Some("topic"), Some("machine"))
+            .unwrap();
+        m.observe_extracted("zoe --lives_in--> lisbon", 101);
+        m.maintain(101);
+        save(&m, &path).unwrap();
+
+        assert_eq!(
+            edge_context_rows(&path),
+            vec![
+                (Some("aaaa1111".into()), Some("main".into()), "agent".into()),
+                (Some("bbbb2222".into()), Some("topic".into()), "machine".into()),
+            ],
+            "alice's edge came from ep1, zoe's from ep2"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// (d) The context survives save -> load -> save: the episode is the
+    /// source of truth on the way back in, and re-saving reproduces the
+    /// same denormalised edge columns.
+    #[test]
+    fn assertion_context_survives_a_round_trip() {
+        let path = scratch("ctx-round-trip.db");
+        let mut m = AgentMemory::new(MockExtractor::new(0.9), "").unwrap();
+        m.set_assertion_context(Some("deadbeef"), Some("w44/feat"), Some("machine"))
+            .unwrap();
+        m.observe_extracted("alice --lives_in--> berlin", 100);
+        m.maintain(100);
+        save(&m, &path).unwrap();
+        let before = edge_context_rows(&path);
+
+        let back: AgentMemory<MockExtractor> = load(MockExtractor::new(0.9), &path).unwrap();
+        let ctx = back.episode_context("ep1");
+        assert_eq!(ctx.sha.as_deref(), Some("deadbeef"));
+        assert_eq!(ctx.branch.as_deref(), Some("w44/feat"));
+        assert_eq!(ctx.class, FactClass::Machine);
+
+        let again = scratch("ctx-round-trip-2.db");
+        save(&back, &again).unwrap();
+        assert_eq!(edge_context_rows(&again), before);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&again);
+    }
+
+    /// (f) `bounded_by` is wired end to end: set on an edge that predates
+    /// recorded history (`valid_from = i64::MIN`), it reaches the column
+    /// and comes back. NOTHING populates it yet — the pickaxe backfill
+    /// that would is deferred (ADR 3) — so this is the only path that
+    /// proves the column is not write-only.
+    #[test]
+    fn bounded_by_round_trips_with_an_open_left_interval() {
+        let path = scratch("bounded-by.db");
+        let mut m = AgentMemory::new(MockExtractor::new(0.9), "").unwrap();
+        let (s, p, o) = (m.engine.sym("monolith"), m.engine.sym("uses"), m.engine.sym("smarty"));
+        m.engine.declare(
+            "edge",
+            &[
+                s,
+                p,
+                o,
+                Value::Int(i64::MIN), // predates recorded history
+                Value::Int(i64::MAX),
+                Value::Int(5),
+            ],
+            Ann::base(
+                0.9,
+                [
+                    "ep1".to_string(),
+                    format!("{BOUNDED_BY_PROV}first-commit-2014"),
+                ],
+            ),
+        );
+        m.engine.set_now(10);
+        let _ = m.engine.run();
+        save(&m, &path).unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let (bounded, vf): (Option<String>, i64) = conn
+            .query_row("SELECT bounded_by, valid_from FROM edges", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(bounded.as_deref(), Some("first-commit-2014"));
+        assert_eq!(vf, i64::MIN, "the left-open sentinel is what it bounds");
+        let stray: i64 = conn
+            .query_row("SELECT count(*) FROM edge_prov WHERE prov LIKE 'bounded_by:%'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stray, 0, "the marker becomes a column, not a prov row");
+        drop(conn);
+
+        let back: AgentMemory<MockExtractor> = load(MockExtractor::new(0.9), &path).unwrap();
+        let e = &back.engine.relations["edge"].rows[0];
+        assert!(
+            e.fact.ann.prov.contains(&format!("{BOUNDED_BY_PROV}first-commit-2014")),
+            "the column must rebuild the marker: {:?}",
+            e.fact.ann.prov
+        );
         let _ = std::fs::remove_file(&path);
     }
 

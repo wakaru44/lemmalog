@@ -103,12 +103,22 @@ CREATE TABLE IF NOT EXISTS fact_prov (
 -- from the row count, so insertion order is load-bearing. `ts` ties (several
 -- facts asserted in one turn) and TEXT ids that sort `ep10` before `ep2`
 -- both scramble it, hence an explicit ordinal as the primary key.
+--
+-- An episode is one ingestion call, so the commit, branch and class the
+-- caller was on are properties of the EPISODE, not of each triple it
+-- produced: this is where they live. `edges` carries them denormalised
+-- only so `WHERE asserted_on_branch = ?` needs no join; on load this
+-- table is the source of truth.
 CREATE TABLE IF NOT EXISTS episodes (
-  ord     INTEGER PRIMARY KEY,
-  id      TEXT NOT NULL UNIQUE,
-  ts      INTEGER NOT NULL,
-  speaker TEXT,
-  text    TEXT NOT NULL
+  ord        INTEGER PRIMARY KEY,
+  id         TEXT NOT NULL UNIQUE,
+  ts         INTEGER NOT NULL,
+  speaker    TEXT,
+  text       TEXT NOT NULL,
+  sha        TEXT,
+  branch     TEXT,
+  fact_class TEXT NOT NULL DEFAULT 'agent'
+             CHECK (fact_class IN ('machine','agent','human'))
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS escalations (
