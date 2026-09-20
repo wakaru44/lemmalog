@@ -211,6 +211,10 @@ added=0 updated=0 noop=0 escalations=0 rejected=1
   rejected: svc:x --frobnicates--> svc:y (unknown relation `frobnicates`)
 ```
 
+(Both runs above were made outside a git checkout. Inside one, a line naming
+the commit, branch and fact class sits between the summary and the refusals —
+see [`storage.md` §6](storage.md).)
+
 A non-blocking violation reads differently, and deliberately so: the fact is
 in the store and the flag is a backlog item, not a failure.
 
@@ -223,6 +227,57 @@ added=1 updated=0 noop=0 escalations=1
 The fix for a rejection is always the same: declare the relation in
 `ontology.yaml`, or correct the fact. There is no override flag, because an
 override would reintroduce the guess the file exists to remove.
+
+## `fact_class` — a second axis, with a different lifecycle
+
+`cardinality` answers *how many values of this relation may be open at
+once*. `fact_class` answers a question the vocabulary file does not touch:
+*who claimed this, and how does it stop being true*. The two are
+orthogonal, and only the first is declared here — `fact_class` is set per
+ingestion (`--fact-class` on the CLI, `fact_class` on `lemmalog_observe`),
+never per relation, because the same relation can be asserted by a
+generator on one call and by a human on the next. The columns and the
+queries live in [`storage.md` §6](storage.md); this section is only about
+what the three values mean for the vocabulary story.
+
+| Class | Who claimed it | How it stops being true |
+| --- | --- | --- |
+| `machine` | tooling that can rerun | **regenerated** — fix the generator and re-observe |
+| `agent` | an agent, with evidence | **retracted** — `wrong` deletes it, `world_changed` closes it |
+| `human` | a person, authoritatively | retracted by the person who asserted it; outranks the other two |
+
+The difference that matters is `machine`. A machine-derived fact is a
+projection of something else — a dependency graph, a schema dump, a
+generated index — so hand-retracting one is editing a cache. The fact
+comes back on the next run, and the retraction has bought nothing but a
+closed row and some confusion. The move is to fix the generator, or its
+input, and re-observe.
+
+This is a lifecycle convention, **not an enforced rule**. Nothing in
+`apply_update` or `src/ontology.rs` reads `fact_class`; a `machine` fact
+can be retracted exactly like any other. What the column buys is that the
+question is answerable before you act — "which of these did tooling
+write?" is one `WHERE fact_class = 'machine'` away instead of a guess from
+the relation name.
+
+The interaction with this file is therefore a soft one and worth stating
+plainly, because it is easy to expect more: a declared `accumulating`
+relation stays accumulating whoever asserts it, and a `requires_evidence`
+flag fires the same way for a generator as for an agent. `fact_class` does
+not relax or tighten any check here. It records the authority, and the
+authority is what tells a reader whether a stale row is a bug in an agent's
+reading or a bug in a generator.
+
+An unrecognised class stops the run rather than quietly defaulting to
+`agent`, for the same reason an unknown relation is rejected rather than
+guessed: a wrong authority level on a real fact is worse than a refused
+write.
+
+```console
+$ lemmalog-cli observe --fact-class machine --facts 'svc:billing --calls--> svc:ledger'
+added=1 updated=0 noop=0 escalations=0
+fact_class=machine
+```
 
 ## Migration note — what `apply_update` does, and what is still open
 

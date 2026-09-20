@@ -1,3 +1,38 @@
+> # ⚠️ SUPERSEDED DESIGN RECORD — NOT CURRENT DOCUMENTATION
+>
+> **Superseded: 2026-09-20.** This was a *pre-implementation proposal*, written to be
+> argued over before the SQLite store existed. It did that job and is kept only as a
+> record of the reasoning. **The DDL below is stale and does not match the shipped
+> schema. Do not read it as documentation, do not copy SQL out of it.**
+>
+> Current sources of truth:
+>
+> - **`src/storage/schema.sql`** — the schema itself (embedded with `include_str!`, `SCHEMA_VERSION = 3`).
+> - **`docs/storage.md`** — the operator guide.
+>
+> The body below is left **unedited on purpose**: a design record that has been quietly
+> patched to match reality records nothing. The section immediately below is the only
+> addition — it lists where the guesses turned out wrong.
+
+## What actually shipped differently
+
+Compared against `src/storage/schema.sql` on 2026-09-20.
+
+- **Edge objects.** Draft: `object TEXT NOT NULL` — an edge always points at a symbol. Shipped: `object_kind` (`'sym'`/`'int'`) + nullable `object TEXT` + `object_int INTEGER`, with a CHECK enforcing exactly one. Integer-valued edge objects were not a concept when this was written; `edges` is now the complete edge set and SQL never has to union in `facts`.
+- **Edge identity.** Draft: no uniqueness beyond the surrogate `id`. Shipped: `UNIQUE (subject, predicate, object_kind, object, object_int, valid_from, valid_to, asserted_at)`.
+- **Episodes keyed by insertion order.** Draft: `id TEXT PRIMARY KEY` (`'ep17'`). Shipped: `ord INTEGER PRIMARY KEY` with `id TEXT NOT NULL UNIQUE` — ids are positional and TEXT sorting puts `ep10` before `ep2`, so replay order needed an explicit ordinal.
+- **Episodes own the assertion provenance.** Draft: `sha` / `branch` / `fact_class` existed only on `edges`. Shipped: `episodes` carries `sha`, `branch`, `fact_class` and is the source of truth on load; `edges` keeps them denormalised only so `WHERE asserted_on_branch = ?` needs no join.
+- **Provenance for non-edge facts.** Draft: `edge_prov` only. Shipped: a matching `fact_prov (fact_id, prov)` table — n-ary facts keep their provenance set too.
+- **Constraints the draft left off.** Shipped adds `CHECK (confidence BETWEEN 0.0 AND 1.0)` on `facts` (draft had it on `edges` only) and the `sym`/`int` one-of-two CHECK on `fact_args` (draft declared the columns but not the invariant).
+- **Retraction columns landed with the first cut, not as step 3.** The draft's order of work deferred them. Shipped they are present and documented: `'wrong'` never reaches the store (a wrong fact is deleted — it was never true), while `'world_changed'` / `'superseded'` close `valid_to` and keep the row.
+- **Idempotent DDL.** Draft: bare `CREATE TABLE` / `CREATE INDEX`. Shipped: `IF NOT EXISTS` throughout, because the file is applied on every open.
+- **`PRAGMA journal_mode = WAL` is not in the schema file.** Draft put it at the top of the DDL. Shipped it is set by the connection code (`src/storage/mod.rs`), so the schema stays pure DDL.
+- **Extra index.** Shipped adds `facts_pred ON facts (predicate)`; the draft indexed `edges` only.
+- **Driver.** Draft: `sqlx`. Shipped: `rusqlite` (bundled), behind the optional `sqlite` feature.
+- **Versioning.** Draft: `schema_version` mentioned in passing as a `meta` key. Shipped: `SCHEMA_VERSION = 3`, and `load` refuses any store that is not the binary's own version — no migration path, by design, since the store is a rebuildable projection.
+
+---
+
 # SQLite storage — schema draft
 
 Branch `w44/feat/alt_storage`. Replaces the single-snapshot persistence

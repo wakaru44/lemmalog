@@ -4,7 +4,7 @@
 //! scripts, cron jobs — every mutation here is visible to the next MCP
 //! load and vice versa.
 //!
-//!   lemmalog-cli observe  --facts 'alice --works_at--> acme'
+//!   lemmalog-cli observe  --facts 'alice --works_at--> acme' [--fact-class human]
 //!   lemmalog-cli query   --goal 'current("alice", R, O)'
 //!   lemmalog-cli retract --facts 'alice --works_at--> acme' [--reason world_changed] [--by agent-7]
 //!   lemmalog-cli suspects
@@ -23,10 +23,14 @@
 //! for fresh-session queries). A `.db`, `.sqlite` or `.sqlite3` extension
 //! selects the SQLite store (needs the `sqlite` feature); anything else is
 //! the tab-separated snapshot.
+//!
+//! Env: LEMMALOG_REPO (working tree whose HEAD stamps the facts, ADR 3;
+//! default: the current directory). The store usually lives outside the
+//! codebase being documented, so the repo is named separately from it.
 
 #![cfg(feature = "mcp")]
 
-use lemmalog::agent::{AgentMemory, MockExtractor};
+use lemmalog::agent::{AgentMemory, AssertionContext, FactClass, MockExtractor};
 use lemmalog::RetractReason;
 use std::io::Read;
 
@@ -152,6 +156,77 @@ fn load(path: &str) -> AgentMemory<MockExtractor> {
     m
 }
 
+/// Working tree whose HEAD is recorded on the facts this run asserts.
+/// Unset means the current directory — but the agent usually runs inside
+/// the codebase it is documenting while the store lives elsewhere, so the
+/// two are named apart.
+const REPO_ENV: &str = "LEMMALOG_REPO";
+
+/// `(sha, branch)` of `LEMMALOG_REPO`'s HEAD, for ADR 3's provenance
+/// columns. The library deliberately knows nothing about git; the
+/// binaries resolve it and hand it over.
+///
+/// `git` is asked rather than `.git/HEAD` parsed on purpose: worktrees,
+/// packed refs and detached HEAD are all already correct in `rev-parse`
+/// and all wrong in a hand-rolled reader.
+///
+/// Every failure — not a repo, no git on PATH, a repo with no commits yet
+/// — is `(None, None)` and silence. A store used outside a checkout has
+/// to keep working exactly as it did, and a warning on every invocation
+/// would be noise on the one path that cannot act on it.
+///
+/// Detached HEAD reports branch `None`: `--abbrev-ref` answers the literal
+/// string "HEAD", which is not a branch name, and inventing one ("HEAD",
+/// "detached", the nearest tag) would put a value in
+/// `edges.asserted_on_branch` that no `git checkout` can ever match. The
+/// sha is still recorded, and it is the one that identifies the revision.
+fn git_head() -> (Option<String>, Option<String>) {
+    let repo = std::env::var(REPO_ENV).unwrap_or_default();
+    let rev = |args: &[&str]| -> Option<String> {
+        let mut cmd = std::process::Command::new("git");
+        if !repo.is_empty() {
+            cmd.arg("-C").arg(&repo);
+        }
+        let out = cmd
+            .args(args)
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    };
+    let sha = rev(&["rev-parse", "HEAD"]);
+    let branch = rev(&["rev-parse", "--abbrev-ref", "HEAD"]).filter(|b| b != "HEAD");
+    (sha, branch)
+}
+
+/// What the run stamped, for an operator who is not going to open SQLite.
+///
+/// `None` when there is nothing to say — no sha, no branch, default class
+/// — so an observe outside a checkout prints byte-for-byte what it printed
+/// before this existed (`tests/cli_behaviour.rs` pins that summary line).
+fn provenance_line(ctx: &AssertionContext) -> Option<String> {
+    if ctx.sha.is_none() && ctx.branch.is_none() && ctx.class == FactClass::default() {
+        return None;
+    }
+    let mut line = String::new();
+    if let Some(sha) = &ctx.sha {
+        line.push_str(&format!("asserted_at_sha={sha} "));
+    }
+    if let Some(b) = &ctx.branch {
+        line.push_str(&format!("asserted_on_branch={b} "));
+    }
+    line.push_str(&format!("fact_class={}", ctx.class.as_str()));
+    Some(line)
+}
+
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
         .position(|a| a == name)
@@ -176,6 +251,16 @@ fn main() {
             let text = stdin_or_flag(&args, "--facts");
             let ts = flag(&args, "--ts").and_then(|t| t.parse::<i64>().ok());
             let ts = ts.unwrap_or_else(wall_clock);
+            // ADR 3: stamp the episode with where it was asserted from
+            // BEFORE it is ingested. An unknown --fact-class stops the run
+            // rather than quietly demoting the facts to the default.
+            let (sha, branch) = git_head();
+            let class = flag(&args, "--fact-class");
+            if let Err(e) = m.set_assertion_context(sha.as_deref(), branch.as_deref(), class.as_deref())
+            {
+                eprintln!("lemmalog-cli: {e}");
+                std::process::exit(2);
+            }
             let (report, dropped) = m.observe_extracted(&text, ts);
             // observe_extracted sets the clock to `ts`, so an explicit
             // backdated --ts would otherwise persist a past NOW.
@@ -196,6 +281,12 @@ fn main() {
                 report.noop,
                 report.escalations.len()
             );
+            // Second line, and only when there is something to report: the
+            // summary line above is asserted byte-for-byte by
+            // tests/cli_behaviour.rs.
+            if let Some(p) = provenance_line(m.assertion_context()) {
+                println!("{p}");
+            }
             // Each entry already reads "rejected: S --rel--> O (why)".
             for r in report.rejected.iter().take(5) {
                 println!("{r}");
@@ -394,7 +485,9 @@ fn main() {
         other => {
             eprintln!(
                 "usage: lemmalog-cli observe|retract|suspects|reverify|query|context|why|rules|rmrules|batches|dump [flags]\n\
-                 flags: --facts|--goal|--query|--fact|--rules|--id|--pred|--ts|--budget|--reason|--by  (or stdin)\n\
+                 flags: --facts|--goal|--query|--fact|--rules|--id|--pred|--ts|--budget|--reason|--by|--fact-class  (or stdin)\n\
+                 observe --fact-class machine|agent|human (default agent) records how authoritative\n\
+                   the facts are; HEAD of $LEMMALOG_REPO (default: cwd) is recorded with them\n\
                  retract --reason wrong (default: deletes, dependents die) | world_changed | superseded\n\
                  retract --by <who> records the retractor (edges.retracted_by); omitted = unrecorded\n\
                    (world_changed/superseded close the fact in valid time and mark dependents\n\
