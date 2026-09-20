@@ -1,0 +1,19 @@
+src/agent.rs
+  s_e6045d8ee74ea2::t_591062da1102f1 499-526,528
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3f6b497f53d725b4f1ae1181200c5057d95cecb7",
+  "prompts": {},
+  "sessions": {
+    "s_e6045d8ee74ea2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcbf69c7-331f-48cd-9532-bb93ed8b4605",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Wakaru Himura <wakaru44@gmail.com>"
+    }
+  }
+}
