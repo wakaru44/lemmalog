@@ -1,0 +1,19 @@
+docs/adr/0004-rusqlite-over-sqlx.md
+  s_e6045d8ee74ea2::t_2e55ff2253ac2f 1-22
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0ac7b44f3121ffdc4954fa211d3a0d63da91b47a",
+  "prompts": {},
+  "sessions": {
+    "s_e6045d8ee74ea2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcbf69c7-331f-48cd-9532-bb93ed8b4605",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Wakaru Himura <wakaru44@gmail.com>"
+    }
+  }
+}
