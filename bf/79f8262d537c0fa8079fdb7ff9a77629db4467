@@ -1,0 +1,26 @@
+src/storage/mod.rs
+  s_e6045d8ee74ea2::t_01ea4dbf4a88b5 269-276
+tests/crash_consistency.rs
+  s_e6045d8ee74ea2::t_070d8e4a803327 1-254
+  s_e6045d8ee74ea2::t_9962e95a08cab0 255-286
+src/bin/lemmalog-cli.rs
+  s_e6045d8ee74ea2::t_36e49ca9212b49 9,228-241,251,253-255,397,399
+src/bin/lemmalog-mcp.rs
+  s_e6045d8ee74ea2::t_c9c079a19b9f3c 169,226,456-460,489-494,510-521
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "bf79f8262d537c0fa8079fdb7ff9a77629db4467",
+  "prompts": {},
+  "sessions": {
+    "s_e6045d8ee74ea2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcbf69c7-331f-48cd-9532-bb93ed8b4605",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Wakaru Himura <wakaru44@gmail.com>"
+    }
+  }
+}
