@@ -1,0 +1,38 @@
+src/agent.rs
+  s_e6045d8ee74ea2::t_9b22b8aabeea9a 1510-1543
+  s_e6045d8ee74ea2::t_3392dc072dbedc 585-605
+src/bin/lemmalog-cli.rs
+  s_e6045d8ee74ea2::t_bf2c6e26085584 121,124
+  s_e6045d8ee74ea2::t_2c0e183a3672a2 20-23,31-32,34-81,86-90
+  s_e6045d8ee74ea2::t_c06f22b6286fd1 82-85
+  s_6eecfaa18726f6::t_360d15541c8f0e 161,177,225,242
+src/bin/lemmalog-mcp.rs
+  s_e6045d8ee74ea2::t_d10c9844723a9d 9-12
+  s_e6045d8ee74ea2::t_4fec4bc12afef5 64-66
+  s_e6045d8ee74ea2::t_6bb7229780af13 39-63,67-85,88-99,104,106
+  s_6eecfaa18726f6::t_d9db6b6d22947a 674,676,744
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "49aaa4fa6cb5a0443676908d705ddc8d176aebf5",
+  "prompts": {},
+  "sessions": {
+    "s_6eecfaa18726f6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a8168030c716be223",
+        "model": "unknown"
+      },
+      "human_author": "Wakaru Himura <wakaru44@gmail.com>"
+    },
+    "s_e6045d8ee74ea2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcbf69c7-331f-48cd-9532-bb93ed8b4605",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Wakaru Himura <wakaru44@gmail.com>"
+    }
+  }
+}
