@@ -4,6 +4,9 @@
 -- Postgres is then INTEGER PRIMARY KEY -> BIGSERIAL and REAL -> DOUBLE
 -- PRECISION.
 
+-- Also holds `schema_version`: `save` writes it, `load` refuses anything
+-- that is not the binary's own version. There is no migration path, by
+-- design — the store is a rebuildable projection of the snapshot.
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -96,8 +99,13 @@ CREATE TABLE IF NOT EXISTS fact_prov (
 
 -- Verbatim source text. No length limit here; the 8-word / 60-char clip
 -- is a parser guard (entity_token_problem), not a storage one.
+-- Episode ids are positional (`ep{n}`) and `episode_counter` is restored
+-- from the row count, so insertion order is load-bearing. `ts` ties (several
+-- facts asserted in one turn) and TEXT ids that sort `ep10` before `ep2`
+-- both scramble it, hence an explicit ordinal as the primary key.
 CREATE TABLE IF NOT EXISTS episodes (
-  id      TEXT PRIMARY KEY,
+  ord     INTEGER PRIMARY KEY,
+  id      TEXT NOT NULL UNIQUE,
   ts      INTEGER NOT NULL,
   speaker TEXT,
   text    TEXT NOT NULL

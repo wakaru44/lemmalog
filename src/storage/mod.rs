@@ -22,6 +22,17 @@ use rusqlite::{params, Connection};
 
 const SCHEMA: &str = include_str!("schema.sql");
 
+/// Shape of `schema.sql`. Bump on any change that makes a store written by
+/// an older binary unreadable — there is no migration path, so `load`
+/// refuses a mismatch instead of guessing. v2 added `episodes.ord`.
+const SCHEMA_VERSION: u32 = 2;
+
+/// The version a store without a `schema_version` key was written at: the
+/// key did not exist before v2, so its absence pins the store to v1.
+const OLDEST_VERSION: u32 = 1;
+
+const VERSION_KEY: &str = "schema_version";
+
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
 fn open(path: &str) -> Res<Connection> {
@@ -115,6 +126,7 @@ pub fn save<X: Extractor>(m: &AgentMemory<X>, path: &str) -> Res<()> {
 
     {
         let mut meta = tx.prepare("INSERT INTO meta (key, value) VALUES (?1, ?2)")?;
+        meta.execute(params![VERSION_KEY, SCHEMA_VERSION.to_string()])?;
         meta.execute(params!["now", m.engine.now.to_string()])?;
         meta.execute(params!["extra_rules", &m.extra_rules])?;
 
@@ -130,9 +142,10 @@ pub fn save<X: Extractor>(m: &AgentMemory<X>, path: &str) -> Res<()> {
             ord += 1;
         }
 
-        let mut ep = tx.prepare("INSERT INTO episodes (id, ts, speaker, text) VALUES (?1,?2,?3,?4)")?;
-        for e in &m.episodes {
-            ep.execute(params![e.id, e.ts, e.speaker, e.text])?;
+        let mut ep = tx
+            .prepare("INSERT INTO episodes (ord, id, ts, speaker, text) VALUES (?1,?2,?3,?4,?5)")?;
+        for (i, e) in m.episodes.iter().enumerate() {
+            ep.execute(params![i as i64, e.id, e.ts, e.speaker, e.text])?;
         }
 
         let mut esc = tx.prepare("INSERT INTO escalations (id, text) VALUES (?1, ?2)")?;
@@ -241,6 +254,20 @@ pub fn load<X: Extractor>(extractor: X, path: &str) -> Res<AgentMemory<X>> {
             None => None,
         })
     };
+    // A store that has never been written has no meta rows at all — that is
+    // the "start fresh" case (the schema is created on open), not a version
+    // mismatch. Anything with meta in it was written by some binary, and
+    // must say which.
+    let written: i64 = conn.query_row("SELECT count(*) FROM meta", [], |r| r.get(0))?;
+    if written > 0 {
+        let found = meta(VERSION_KEY)?
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(OLDEST_VERSION);
+        if found != SCHEMA_VERSION {
+            return Err(version_error(found).into());
+        }
+    }
+
     let now: i64 = meta("now")?.unwrap_or_default().parse().unwrap_or(0);
     let rules = meta("extra_rules")?.unwrap_or_default();
 
@@ -249,10 +276,11 @@ pub fn load<X: Extractor>(extractor: X, path: &str) -> Res<AgentMemory<X>> {
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<Result<_, _>>()?;
 
-    // No ordinal column on `episodes`; (ts, id) is the stable order the
-    // snapshot's insertion order carries anyway.
+    // `ord` is the in-memory Vec index: episode ids are positional, so the
+    // original insertion order is the only correct one. (ts, id) is not a
+    // substitute — one turn's facts share a ts, and `ep10` < `ep2` as TEXT.
     let episodes: Vec<Episode> = conn
-        .prepare("SELECT id, ts, speaker, text FROM episodes ORDER BY ts, id")?
+        .prepare("SELECT id, ts, speaker, text FROM episodes ORDER BY ord")?
         .query_map([], |r| {
             Ok(Episode {
                 id: r.get(0)?,
@@ -365,6 +393,25 @@ pub fn load<X: Extractor>(extractor: X, path: &str) -> Res<AgentMemory<X>> {
     let _ = m.engine.run();
     m.last_turn_epoch = m.engine.epoch();
     Ok(m)
+}
+
+/// What to tell the operator when a store's schema version is not ours.
+/// Never a migration, never a silent load: the store is a projection that
+/// can be rebuilt, and guessing at an old shape corrupts it quietly.
+fn version_error(found: u32) -> String {
+    if found < SCHEMA_VERSION {
+        format!(
+            "store schema version {found} is older than this binary's schema version \
+             {SCHEMA_VERSION}; no migration path exists — delete this store and rebuild \
+             it (save again from a snapshot or a running memory)"
+        )
+    } else {
+        format!(
+            "store schema version {found} is newer than this binary's schema version \
+             {SCHEMA_VERSION}; upgrade the binary to one that understands schema version \
+             {found} to read this store"
+        )
+    }
 }
 
 fn prov(conn: &Connection, table: &str, col: &str, id: i64) -> Res<Vec<String>> {
@@ -528,6 +575,96 @@ mod tests {
         assert!(prov.contains("retracted_by:tester"), "{prov:?}");
         assert!(prov.contains("ep1"), "original provenance survives: {prov:?}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Insertion order is the only correct episode order: ids are
+    /// positional, and the two things that used to stand in for it both
+    /// break here — a shared `ts`, and TEXT ids where `ep10` < `ep2`.
+    #[test]
+    fn episodes_keep_insertion_order_with_one_shared_ts() {
+        let path = scratch("episode-order.db");
+        let mut m = AgentMemory::new(MockExtractor::new(0.9), "").unwrap();
+        for i in 1..=12 {
+            m.episodes.push(Episode {
+                id: format!("ep{i}"),
+                ts: 500, // one turn: every episode shares a timestamp
+                speaker: None,
+                text: format!("line {i}"),
+            });
+        }
+        m.episode_counter = m.episodes.len() as u64;
+        let ids: Vec<String> = m.episodes.iter().map(|e| e.id.clone()).collect();
+        save(&m, &path).unwrap();
+
+        let back: AgentMemory<MockExtractor> = load(MockExtractor::new(0.9), &path).unwrap();
+        let got: Vec<String> = back.episodes.iter().map(|e| e.id.clone()).collect();
+        assert_eq!(got, ids, "episodes must come back in insertion order");
+        assert_eq!(back.episodes[9].text, "line 10", "ep10 is still the 10th");
+        assert_eq!(back.episode_counter, 12, "counter follows the episode count");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Rewrite the version row of a real store, the way an older or newer
+    /// binary would have left it.
+    fn set_version(path: &str, v: Option<&str>) {
+        let conn = Connection::open(path).unwrap();
+        match v {
+            Some(v) => conn
+                .execute("UPDATE meta SET value = ?1 WHERE key = ?2", params![v, VERSION_KEY]),
+            None => conn.execute("DELETE FROM meta WHERE key = ?1", params![VERSION_KEY]),
+        }
+        .unwrap();
+    }
+
+    /// `unwrap_err` needs `Debug` on the Ok side; `AgentMemory` has none.
+    fn load_err(path: &str) -> String {
+        match load(MockExtractor::new(0.9), path) {
+            Ok(_) => panic!("load must refuse a version mismatch"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    fn saved_store(name: &str) -> String {
+        let path = scratch(name);
+        let mut m = AgentMemory::new(MockExtractor::new(0.9), "").unwrap();
+        m.observe_extracted("alice --lives_in--> berlin", 100);
+        m.maintain(100);
+        save(&m, &path).unwrap();
+        path
+    }
+
+    #[test]
+    fn matching_version_loads_and_mismatches_are_errors() {
+        // (f) the ordinary path still works end to end.
+        let path = saved_store("version-ok.db");
+        let back: AgentMemory<MockExtractor> = load(MockExtractor::new(0.9), &path).unwrap();
+        assert_eq!(back.episodes.len(), 1);
+        assert_eq!(back.engine.relations["edge"].rows.len(), 1);
+
+        // (c) older version: rebuild, no migration.
+        set_version(&path, Some("1"));
+        let e = load_err(&path);
+        assert!(e.contains("version 1 is older"), "{e}");
+        assert!(e.contains(&SCHEMA_VERSION.to_string()), "{e}");
+        assert!(e.contains("no migration path") && e.contains("rebuild"), "{e}");
+
+        // (d) no version key at all (written before the guard existed):
+        // same actionable error, not a confusing SQL failure.
+        set_version(&path, None);
+        let missing = load_err(&path);
+        assert_eq!(missing, e, "a keyless store is the oldest known version");
+
+        // (e) newer version: upgrade the binary.
+        let path = saved_store("version-newer.db");
+        set_version(&path, Some(&(SCHEMA_VERSION + 1).to_string()));
+        let e = load_err(&path);
+        assert!(e.contains("is newer") && e.contains("upgrade the binary"), "{e}");
+
+        // A store that was never written is "start fresh", not a mismatch.
+        let fresh = scratch("version-fresh.db");
+        let empty: AgentMemory<MockExtractor> = load(MockExtractor::new(0.9), &fresh).unwrap();
+        assert!(empty.episodes.is_empty());
+        let _ = std::fs::remove_file(&fresh);
     }
 
     fn counts<X: Extractor>(m: &AgentMemory<X>) -> Vec<(String, usize)> {

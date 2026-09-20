@@ -12,6 +12,7 @@
 use crate::eval::{Ann, Engine};
 use crate::intern::Term;
 use crate::intern::Value;
+use crate::ontology::{Cardinality, Ontology};
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -381,6 +382,11 @@ pub struct IngestReport {
     pub updated: usize,
     pub noop: usize,
     pub escalations: Vec<String>,
+    /// Candidate facts a loaded ontology refused (unknown relation, domain
+    /// or range mismatch), each with its reason. They are NOT in the store —
+    /// this is the only place a caller can see them, so nothing is dropped
+    /// silently.
+    pub rejected: Vec<String>,
 }
 
 /// One entry of the re-verification queue: a fact that is neither true nor
@@ -415,6 +421,33 @@ pub struct AgentMemory<X: Extractor> {
     pub(crate) last_turn_epoch: u64,
     pub(crate) extra_rules: String,
     hyp_counter: u64,
+    ontology: OntologySource,
+}
+
+/// Env var naming an `ontology.yaml` to enforce. Opt-in: unset (or naming a
+/// file that is not there) means nothing is enforced, which is what every
+/// store written before the ontology existed depends on.
+pub const ONTOLOGY_ENV: &str = "LEMMALOG_ONTOLOGY";
+
+/// Where the declared vocabulary comes from. Resolved on first ingestion,
+/// never at construction: reopening an old store must not read a file, and a
+/// caller that sets an ontology explicitly must win over the environment.
+enum OntologySource {
+    /// Nothing asked for yet — consult [`ONTOLOGY_ENV`] on first use.
+    Unresolved,
+    /// Nothing to enforce: prefix tables only, exactly as before.
+    Off,
+    On(Ontology),
+}
+
+/// What a loaded ontology says about one candidate fact.
+enum OntologyVerdict {
+    /// Blocking violation: the fact must not enter the store.
+    Reject,
+    /// Declared, and this is its cardinality — it outranks the prefix tables.
+    Declared(Cardinality),
+    /// No ontology loaded, or it does not declare this relation: fall back.
+    Undeclared,
 }
 
 pub const DEFAULT_RULES: &str = "\
@@ -458,7 +491,93 @@ impl<X: Extractor> AgentMemory<X> {
             last_turn_epoch: 0,
             extra_rules: extra_rules.to_string(),
             hyp_counter: 0,
+            ontology: OntologySource::Unresolved,
         })
+    }
+
+    /// Enforce this vocabulary from now on, overriding [`ONTOLOGY_ENV`].
+    pub fn set_ontology(&mut self, onto: Ontology) {
+        self.ontology = OntologySource::On(onto);
+    }
+
+    /// Load `path` and enforce it. A malformed file is an `Err` naming the
+    /// line — never a silent no-op.
+    pub fn set_ontology_path(&mut self, path: &str) -> Result<(), String> {
+        self.ontology = OntologySource::On(Ontology::from_path(path)?);
+        Ok(())
+    }
+
+    /// Builder form of [`AgentMemory::set_ontology`].
+    pub fn with_ontology(mut self, onto: Ontology) -> Self {
+        self.set_ontology(onto);
+        self
+    }
+
+    /// The vocabulary in force, if one has been resolved. `None` before the
+    /// first ingestion even when [`ONTOLOGY_ENV`] is set, by design.
+    pub fn ontology(&self) -> Option<&Ontology> {
+        match &self.ontology {
+            OntologySource::On(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// First-use resolution of [`ONTOLOGY_ENV`]. Unset, empty or absent file
+    /// -> nothing is enforced; unreadable or malformed file -> nothing is
+    /// enforced either, but the parse error is escalated rather than eaten.
+    fn resolve_ontology(&mut self, report: &mut IngestReport) {
+        if !matches!(self.ontology, OntologySource::Unresolved) {
+            return;
+        }
+        let path = match std::env::var(ONTOLOGY_ENV) {
+            Ok(p) if !p.trim().is_empty() => p,
+            _ => {
+                self.ontology = OntologySource::Off;
+                return;
+            }
+        };
+        if !std::path::Path::new(&path).exists() {
+            self.ontology = OntologySource::Off;
+            return;
+        }
+        self.ontology = match Ontology::from_path(&path) {
+            Ok(o) => OntologySource::On(o),
+            Err(e) => {
+                report.escalations.push(format!(
+                    "ontology: {ONTOLOGY_ENV}={path} failed to load ({e}) — nothing is being enforced"
+                ));
+                OntologySource::Off
+            }
+        };
+    }
+
+    /// Validate one candidate against the vocabulary in force and report the
+    /// outcome. Strict on relations, lenient on entity kinds: a blocking
+    /// violation rejects the fact, a non-blocking one is an escalation and
+    /// the fact is kept.
+    fn ontology_verdict(&mut self, c: &CandidateFact, report: &mut IngestReport) -> OntologyVerdict {
+        self.resolve_ontology(report);
+        let OntologySource::On(onto) = &self.ontology else {
+            return OntologyVerdict::Undeclared;
+        };
+        let violations = onto.check(&c.subj, &c.pred, &c.obj);
+        if let Some(v) = violations.iter().find(|v| v.is_blocking()) {
+            report.rejected.push(format!(
+                "rejected: {} --{}--> {} ({v})",
+                c.subj, c.pred, c.obj
+            ));
+            return OntologyVerdict::Reject;
+        }
+        for v in &violations {
+            report.escalations.push(format!(
+                "ontology: {} --{}--> {} ({v})",
+                c.subj, c.pred, c.obj
+            ));
+        }
+        match onto.cardinality(&c.pred) {
+            Some(k) => OntologyVerdict::Declared(k),
+            None => OntologyVerdict::Undeclared,
+        }
     }
 
     /// Ingest one episode at the current engine time.
@@ -515,9 +634,18 @@ impl<X: Extractor> AgentMemory<X> {
     /// - no open fact with same (S,P)      -> ADD
     /// - open fact with same (S,P,O)       -> NOOP (annotation merge)
     /// - open fact with different O:
-    ///     - P exclusive                   -> UPDATE (close old, assert new)
-    ///     - otherwise                     -> ADD + escalation
+    ///     - P single-valued               -> UPDATE (close old, assert new)
+    ///     - P many-valued                 -> ADD
+    ///     - nothing says which            -> ADD + escalation
+    ///
+    /// A loaded ontology decides the last three: its `cardinality` outranks
+    /// the prefix tables below, and a fact it blocks never reaches the store.
     fn apply_update(&mut self, c: &CandidateFact, ep: &Episode, report: &mut IngestReport) {
+        let declared = match self.ontology_verdict(c, report) {
+            OntologyVerdict::Reject => return,
+            OntologyVerdict::Declared(k) => Some(k),
+            OntologyVerdict::Undeclared => None,
+        };
         let subj = self.engine.sym(&c.subj);
         let pred = self.engine.sym(&c.pred);
         // digit-only objects become integers: quantities and amounts
@@ -586,7 +714,19 @@ impl<X: Extractor> AgentMemory<X> {
         let multi = MULTI.iter().any(|m| pred_name.starts_with(m));
         let functional = FUNCTIONAL.iter().any(|f| pred_name.starts_with(f));
         let exclusive = functional || !self.engine.query("exclusive", &[Some(pred)]).is_empty();
-        if exclusive && !multi {
+        // The prefix tables are a guess about a name; a declaration is not.
+        // Undeclared (or no ontology at all) keeps the guess, escalation and
+        // all -- an existing store must behave exactly as it did before.
+        let supersede = match declared {
+            Some(Cardinality::Single) => true,
+            Some(Cardinality::Accumulating) => false,
+            None => exclusive && !multi,
+        };
+        // A second value is only a *conflict* when nothing — declaration or
+        // prefix — says the relation may hold more than one. Declared
+        // `accumulating` says exactly that, so it accumulates silently.
+        let many_valued = matches!(declared, Some(Cardinality::Accumulating)) || multi;
+        if supersede {
             for old in &open {
                 let mut closed = old.clone();
                 closed[4] = Value::Int(self.engine.now);
@@ -644,7 +784,7 @@ impl<X: Extractor> AgentMemory<X> {
             }
             self.assert_open(&[subj, pred, obj], c.confidence, &ep.id);
             report.updated += 1;
-        } else if multi {
+        } else if many_valued {
             self.assert_open(&[subj, pred, obj], c.confidence, &ep.id);
             report.added += 1;
         } else {
@@ -2011,5 +2151,205 @@ mod suspect_tests {
             after.iter().any(|r| r.contains("carol")) && after.iter().any(|r| r.contains("bob")),
             "untouched facts stay current verbatim: {after:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ontology_policy_tests {
+    use super::*;
+
+    /// A two-relation vocabulary: `assigned_to` is single-valued but matches
+    /// no FUNCTIONAL prefix, `sets_status` is many-valued but matches no
+    /// MULTI prefix. Both are exactly the cases the prefix tables get wrong.
+    const MINI: &str = "\
+version: 1
+
+entity_kinds:
+  person:
+    description: A human.
+  service:
+    description: A running service.
+  literal:
+    description: A bare value.
+  any:
+    description: No constraint.
+
+relations:
+  assigned_to:
+    cardinality: single
+    domain: [any]
+    range: [person]
+    requires_evidence: false
+    description: Who owns it.
+  sets_status:
+    cardinality: accumulating
+    domain: [service]
+    range: [literal]
+    requires_evidence: false
+    description: A status this service writes.
+";
+
+    fn mini() -> Ontology {
+        Ontology::from_str(MINI).expect("mini ontology parses")
+    }
+
+    fn open_objects(m: &mut AgentMemory<MockExtractor>, subj: &str, pred: &str) -> Vec<String> {
+        let s = m.engine.sym(subj);
+        let p = m.engine.sym(pred);
+        m.engine
+            .query("edge", &[Some(s), Some(p), None, None, None, None])
+            .into_iter()
+            .filter(|(k, _)| k[4].as_int() == Some(i64::MAX))
+            .map(|(k, _)| m.engine.interner.display(&k[2]))
+            .collect()
+    }
+
+    /// (a) No ontology: the prefix tables still decide, including the
+    /// no-prefix conflict escalation that the ontology is what fixes.
+    #[test]
+    fn without_an_ontology_nothing_changes() {
+        let mut m = AgentMemory::new(MockExtractor::new(0.9), "").expect("new memory");
+        // FUNCTIONAL prefix: supersede
+        m.observe_extracted("alice --status--> active", 100);
+        let r = m.observe_extracted("alice --status--> away", 200).0;
+        assert_eq!(r.updated, 1, "prefix-driven supersede still fires");
+        assert_eq!(open_objects(&mut m, "alice", "status"), vec!["away".to_string()]);
+        // no prefix at all: accumulate AND escalate, verbatim as today
+        m.observe_extracted("svc --sets_status--> green", 300);
+        let r = m.observe_extracted("svc --sets_status--> amber", 400).0;
+        assert_eq!(r.added, 1);
+        assert_eq!(r.rejected, Vec::<String>::new(), "nothing is enforced");
+        assert_eq!(
+            r.escalations.len(),
+            1,
+            "the pre-existing conflict escalation is preserved: {:?}",
+            r.escalations
+        );
+        assert!(r.escalations[0].starts_with("conflict:"));
+        assert_eq!(open_objects(&mut m, "svc", "sets_status").len(), 2);
+    }
+
+    /// (b) Declared `single` supersedes even with no FUNCTIONAL prefix.
+    #[test]
+    fn declared_single_supersedes_without_a_prefix() {
+        let mut m = AgentMemory::new(MockExtractor::new(0.9), "")
+            .expect("new memory")
+            .with_ontology(mini());
+        m.observe_extracted("ticket-9 --assigned_to--> person:alice", 100);
+        let r = m.observe_extracted("ticket-9 --assigned_to--> person:bob", 200).0;
+        assert_eq!(r.updated, 1, "declaration outranks the prefix tables");
+        assert!(r.escalations.is_empty(), "{:?}", r.escalations);
+        assert_eq!(
+            open_objects(&mut m, "ticket-9", "assigned_to"),
+            vec!["person:bob".to_string()],
+            "only the newest value stays open"
+        );
+    }
+
+    /// (c) The Task 1 bug: declared `accumulating` must not manufacture a
+    /// conflict for an ordinary second value.
+    #[test]
+    fn declared_accumulating_does_not_manufacture_a_conflict() {
+        let mut m = AgentMemory::new(MockExtractor::new(0.9), "")
+            .expect("new memory")
+            .with_ontology(mini());
+        m.observe_extracted("service:api --sets_status--> green", 100);
+        let r = m.observe_extracted("service:api --sets_status--> amber", 200).0;
+        assert_eq!(r.added, 1);
+        assert!(
+            r.escalations.is_empty(),
+            "a many-valued relation is not a conflict: {:?}",
+            r.escalations
+        );
+        assert_eq!(
+            open_objects(&mut m, "service:api", "sets_status").len(),
+            2,
+            "both values coexist"
+        );
+        assert!(m.escalations().is_empty());
+    }
+
+    /// (d) An undeclared relation is blocking: rejected, reported, unstored.
+    #[test]
+    fn unknown_relation_is_rejected_and_reported() {
+        let mut m = AgentMemory::new(MockExtractor::new(0.9), "")
+            .expect("new memory")
+            .with_ontology(mini());
+        let r = m.observe_extracted("person:alice --frobnicates--> person:bob", 100).0;
+        assert_eq!((r.added, r.updated, r.noop), (0, 0, 0));
+        assert_eq!(r.rejected.len(), 1, "the drop is reported");
+        assert!(
+            r.rejected[0].contains("unknown relation `frobnicates`"),
+            "{:?}",
+            r.rejected
+        );
+        assert!(
+            m.engine.relation_keys("edge").is_empty(),
+            "a rejected fact does not enter the store"
+        );
+    }
+
+    /// A declared relation with the wrong kind on the object side blocks too.
+    #[test]
+    fn range_mismatch_is_rejected() {
+        let mut m = AgentMemory::new(MockExtractor::new(0.9), "")
+            .expect("new memory")
+            .with_ontology(mini());
+        let r = m.observe_extracted("ticket-9 --assigned_to--> service:api", 100).0;
+        assert_eq!(r.added, 0);
+        assert_eq!(r.rejected.len(), 1, "{:?}", r.rejected);
+        assert!(m.engine.relation_keys("edge").is_empty());
+    }
+
+    /// (e) An unknown entity kind is lenient: flagged, and kept.
+    #[test]
+    fn unknown_entity_kind_is_accepted_with_an_escalation() {
+        let mut m = AgentMemory::new(MockExtractor::new(0.9), "")
+            .expect("new memory")
+            .with_ontology(mini());
+        let r = m.observe_extracted("robot:r2 --assigned_to--> person:alice", 100).0;
+        assert_eq!(r.added, 1, "the open vocabulary is not a verdict");
+        assert!(r.rejected.is_empty());
+        assert_eq!(r.escalations.len(), 1, "{:?}", r.escalations);
+        assert!(r.escalations[0].contains("unknown entity kind `robot:`"));
+        assert_eq!(m.engine.relation_keys("edge").len(), 1);
+    }
+
+    /// (f) The committed `ontology.yaml`, end to end.
+    #[test]
+    fn the_real_ontology_file_loads_and_enforces() {
+        let mut m = AgentMemory::new(MockExtractor::new(0.9), "").expect("new memory");
+        m.set_ontology_path("ontology.yaml").expect("load ontology.yaml");
+        assert!(m.ontology().is_some());
+
+        let r = m.observe_extracted("method:Invoice::send --calls--> method:Mailer::deliver", 100).0;
+        assert_eq!(r.added, 1, "a conforming fact is stored: {r:?}");
+        assert!(r.rejected.is_empty());
+
+        let r = m.observe_extracted("method:a --frobnicates--> method:b", 200).0;
+        assert_eq!(r.added, 0);
+        assert_eq!(r.rejected.len(), 1, "{:?}", r.rejected);
+
+        // `calls` is declared accumulating: a second callee is not a conflict.
+        let r = m.observe_extracted("method:Invoice::send --calls--> method:Audit::log", 300).0;
+        assert_eq!(r.added, 1);
+        assert!(r.escalations.is_empty(), "{:?}", r.escalations);
+        assert_eq!(open_objects(&mut m, "method:Invoice::send", "calls").len(), 2);
+    }
+
+    /// A malformed file is an error, never a silent no-op.
+    #[test]
+    fn a_malformed_ontology_file_is_an_error() {
+        // pid-unique: a concurrent `cargo test` must not race on this file.
+        let path =
+            std::env::temp_dir().join(format!("lemmalog_bad_ontology_{}.yaml", std::process::id()));
+        std::fs::write(&path, "relations:\n  - calls\n").expect("write temp ontology");
+        let mut m = AgentMemory::new(MockExtractor::new(0.9), "").expect("new memory");
+        let err = m
+            .set_ontology_path(path.to_str().expect("utf-8 path"))
+            .expect_err("malformed ontology must be an Err");
+        assert!(err.contains("line 2"), "the error names the line: {err}");
+        assert!(m.ontology().is_none(), "a failed load enforces nothing");
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -47,7 +47,16 @@ pub use agent::{
     assemble_context, AgentMemory, Episode, Extractor, IngestReport, LlmExtractor, MockExtractor,
     DEFAULT_RULES, EXTRACTION_PROMPT,
 };
+// Retraction taxonomy + re-verification queue, and the line-protocol parser
+// the MCP/CLI front ends share.
+pub use agent::{
+    parse_protocol, parse_protocol_reported, parse_protocol_strict, CandidateFact, RetractReason,
+    SuspectFact, RETRACTED_AT_PROV, RETRACTED_BY_PROV, RETRACT_PROV, VERIFIED_PROV,
+};
 pub use ast::{parse_program, ClauseId, ParseError};
+pub use ontology::{Cardinality, Ontology, RelationDef, Violation};
+#[cfg(feature = "sqlite")]
+pub use storage::{load as load_sqlite, save as save_sqlite};
 pub use eval::{Ann, Annotation, Change, Engine, Interpret, StoredFact, StratError};
 pub use intern::{AggFn, Interner, Term, Value};
 pub use retrieval::{Bm25, Retrieval, Selection};
