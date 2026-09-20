@@ -1,0 +1,58 @@
+docs/storage.md
+  s_e6045d8ee74ea2::t_4a7d483bc96df0 266-267,270-275,278-300,302-303
+  s_e6045d8ee74ea2::t_d6ca32999ad49d 169,208-209,224,227
+src/bin/lemmalog-mcp.rs
+  s_e6045d8ee74ea2::t_c3d8efb88df20d 814-815
+  s_e6045d8ee74ea2::t_db984bc870cb0d 107-117
+  s_e6045d8ee74ea2::t_0c92b4fd02eb8b 482-488
+  s_e6045d8ee74ea2::t_9ccc5d90fcc109 169-173
+  s_e6045d8ee74ea2::t_44f3bf06a501a1 864
+  s_e6045d8ee74ea2::t_34f4e99f09b38b 439-442,445-449,451,455-464
+  s_e6045d8ee74ea2::t_9ab496d4529d67 514
+  s_e6045d8ee74ea2::t_80f2159ddeb064 505-513,515-564
+  s_e6045d8ee74ea2::t_b5ca704732fc06 905
+  s_e6045d8ee74ea2::t_6b8a8c8ccde0f4 32
+  s_e6045d8ee74ea2::t_811a589d417780 385-391,393,399-413
+  s_e6045d8ee74ea2::t_612a2a97c14c0d 225
+src/storage/mod.rs
+  s_e6045d8ee74ea2::t_aa93aa289bd37b 270,709-877
+  s_e6045d8ee74ea2::t_1f3d4ebb5617c5 293,308
+  s_e6045d8ee74ea2::t_0113a0c91a3f50 109-133,137-139,269,284-285
+  s_e6045d8ee74ea2::t_e754e43b0fe474 271-273,277-283,286-292,294
+ontology.yaml
+  s_e6045d8ee74ea2::t_5c167e0a41da30 8-13
+docs/ontology.md
+  s_e6045d8ee74ea2::t_acaae369986a88 255-258,263-266,270-272,276-286
+  s_e6045d8ee74ea2::t_800a52df54a6d5 238-243
+  s_e6045d8ee74ea2::t_073d0c8c8e4c2c 227-232
+  s_e6045d8ee74ea2::t_2c49925be0bea1 90-99,103,108
+  s_e6045d8ee74ea2::t_c66ad2bebaf20a 247-248
+  s_e6045d8ee74ea2::t_829e3c3b3fac5f 3-12
+  s_e6045d8ee74ea2::t_a2a3f74780e1a2 100-102,104-107
+  s_e6045d8ee74ea2::t_1b40cc992fbb12 171-201,203-226
+src/bin/lemmalog-cli.rs
+  s_e6045d8ee74ea2::t_edf7cf9f88b478 30
+  s_e6045d8ee74ea2::t_d364db103e7f9f 212-226,228-233,236-242
+  s_e6045d8ee74ea2::t_eb0a042e5a19c0 133-144
+  s_e6045d8ee74ea2::t_15a84dca801c4c 9-11
+  s_e6045d8ee74ea2::t_c652fcfc1d4d82 185-191,193,199-205
+  s_e6045d8ee74ea2::t_7c314852657881 145,253-295
+  s_e6045d8ee74ea2::t_761e2a5edef981 380-384
+  s_e6045d8ee74ea2::t_33efc3f0f61192 123-129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "539172c178db872ce91cc2abe22276b9383650da",
+  "prompts": {},
+  "sessions": {
+    "s_e6045d8ee74ea2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcbf69c7-331f-48cd-9532-bb93ed8b4605",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Wakaru Himura <wakaru44@gmail.com>"
+    }
+  }
+}
