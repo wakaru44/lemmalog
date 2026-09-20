@@ -519,63 +519,297 @@ $ echo $?
 3
 ```
 
-To rebuild: move the old file aside, then replay the facts into a new store
-(§9) or `save` again from a running memory.
+To rebuild: move the old file aside, then `save` again from a running
+memory. `convert` (§9) cannot help here — it has to load the source, and
+this source is exactly what will not load.
 
-## 9. Worked example: moving a snapshot setup to SQLite
-
-Starting point: a service running with
-`LEMMALOG_MCP_PATH=memory.snapshot`.
-
-**0. Build a binary with the feature, and stop the writer.**
+## 9. Moving a store between backends: `convert`
 
 ```sh
-cargo build --release --features mcp,sqlite
+lemmalog-cli convert --from <path> --to <path> [--force]
 ```
 
-**1. Dump what is currently true from the snapshot, as line protocol.**
-`dump --pred current` prints the derived "true now" relation; the `sed`
-turns it back into the assert syntax.
+`convert` is the only subcommand that names its paths itself instead of
+reading `LEMMALOG_MCP_PATH`, because it is the only one that touches two
+stores. **Each side picks its own backend from its own extension** — the
+same rule as §1 — so all four directions work with one command:
+
+| From | To | What it is |
+| --- | --- | --- |
+| `.snapshot` | `.db` | migrate an existing snapshot setup to SQLite |
+| `.db` | `.tsv` | export a SQLite store to a git-diffable text file (§11) |
+| `.tsv` | `.db` | import that text file back into SQLite |
+| `.db` | `.db` | copy/compact a store |
+| `.snapshot` | `.snapshot` | copy a snapshot (works in a binary built without `sqlite`) |
+
+It is `load` then `save`: the **whole memory** moves, not the "what is
+true now" projection a dump-and-replay moves. Closed edge versions, the
+retraction columns, the original valid/assertion timestamps, episode text
+and the assertion provenance all survive, because they are all things both
+backends persist.
+
+### Migrating a snapshot to SQLite
+
+```console
+$ lemmalog-cli convert --from memory.snapshot --to memory.db
+converted memory.snapshot -> memory.db
+edges=3 other_base_facts=4 episodes=1 escalations=0 rule_batches=2
+```
+
+The second line is there so the counts can be eyeballed against the source
+before anything is cut over. `other_base_facts` is every **non-edge** base
+predicate (§4's `facts` table); derived relations are not counted because
+neither backend persists them — they are recomputed on load.
+
+History is in the destination, not just the current values:
+
+```console
+$ sqlite3 -header -column memory.db \
+    "SELECT subject, predicate, object, valid_to, retract_reason, retracted_by, fact_class
+       FROM edges ORDER BY id;"
+subject             predicate   object          valid_to             retract_reason  retracted_by  fact_class
+------------------  ----------  --------------  -------------------  --------------  ------------  ----------
+svc:billing         owns        table:invoices  9223372036854775807                                agent
+svc:billing         depends_on  svc:orders      9223372036854775807                                agent
+job:invoice_export  status      running         1789937527           world_changed   agent-7       agent
+```
+
+The third row is a fact that **stopped** being true. A replay would not
+have carried it at all.
+
+### Cut over
+
+Point `LEMMALOG_MCP_PATH` at the `.db` for every process (for the MCP
+server, the `--env LEMMALOG_MCP_PATH=...` in its registration, or §10's
+`.mcp.json`) and restart them. Keep the source file: nothing deletes it,
+and it is the archive of the pre-cutover state.
+
+### It refuses rather than guess
+
+| Situation | Behaviour |
+| --- | --- |
+| `--to` exists | exit 2, nothing written — pass `--force` to overwrite |
+| `--from` missing | exit 2, nothing written |
+| `--from` exists but will not load | exit 3, nothing written |
+| either side names `.db` in a binary built without `sqlite` | exit 2, nothing written |
+
+```console
+$ lemmalog-cli convert --from memory.snapshot --to memory.db
+lemmalog-cli: --to "memory.db" already exists.
+  Refusing to overwrite it: convert writes the destination whole.
+  Move it aside, pick another path, or pass --force.
+$ echo $?
+2
+```
+
+`convert` writes the destination **whole**, so an unguarded `--to` is the
+store-wipe of §8 wearing a different hat. `--force` exists for the case
+where overwriting is the intent.
+
+```console
+$ lemmalog-cli convert --from gone.snapshot --to new.db
+lemmalog-cli: --from "gone.snapshot" does not exist; nothing to convert
+$ echo $?
+2
+```
+
+A missing source is an **error**, not "start fresh" — unlike every other
+subcommand, where absence legitimately means a first run. Converting from
+nothing would produce an empty destination and exit 0, which looks exactly
+like a successful migration and is the failure nobody checks.
+
+```console
+$ lemmalog-cli convert --from broken.snapshot --to new.db
+lemmalog-cli: --from "broken.snapshot" exists but could not be loaded (not a lemmalog snapshot).
+  Refusing to run: nothing was written to "new.db".
+$ echo $?
+3
+$ ls new.db
+ls: new.db: No such file or directory
+```
+
+Same exit code and same rule as §8: present-but-unreadable stops the run.
+
+### The old way: replay, and what it costs
+
+Before `convert` the only migration was a replay — dump the derived
+`current` relation, turn it back into assert syntax, and observe it into
+the new store:
 
 ```console
 $ LEMMALOG_MCP_PATH=memory.snapshot lemmalog-cli dump --pred current \
-    | sed -E 's/^current\(([^,]+), ([^,]+), (.+)\)$/\1 --\2--> \3/' \
-    | tee replay.txt
+    | sed -E 's/^current\(([^,]+), ([^,]+), (.+)\)$/\1 --\2--> \3/'
 svc:billing --owns--> table:invoices
 svc:billing --depends_on--> svc:orders
 ```
 
-**2. Replay into the new store.** The `.db` extension selects SQLite and
-the file is created on the spot.
+Two lines out of a three-edge store. What a replay drops:
 
-```console
-$ LEMMALOG_MCP_PATH=new.db lemmalog-cli observe --facts "$(cat replay.txt)"
-added=2 updated=0 noop=0 escalations=0
-asserted_at_sha=b699e1ce1e4563f445db593a3c3f812b5f8ff242 asserted_on_branch=release/2026.09 fact_class=agent
+- **every closed edge version** — the `status running` row above, and with
+  it the whole "true until when, and why not now" answer §7 is built on;
+- `retract_reason`, `retracted_at`, `retracted_by`;
+- the original `valid_from` / `asserted_at` — re-asserted facts are
+  stamped with the replay instant;
+- the original assertion provenance — the new rows carry the HEAD, branch
+  and class the **replay** ran under, not the ones that first asserted them;
+- the verbatim episode text `why()` walks back to;
+- escalations, and any non-edge base fact (`dump --pred current` only
+  prints edges).
+
+For a bitemporal store that is most of the value. **Use `convert` to
+migrate.**
+
+The replay is still a real tool — for **deliberately discarding history**.
+It is how you take a store that has accumulated years of superseded
+versions, retracted claims and stale episode text and start a clean one
+holding only what is true today, re-stamped with the commit that made that
+decision. Wanting the history gone is a legitimate reason to run it; being
+in a hurry is not.
+
+## 10. Per-repo configuration: a committed `.mcp.json`
+
+`LEMMALOG_MCP_PATH`, `LEMMALOG_ONTOLOGY` and `LEMMALOG_REPO` are all read
+from the environment, which means they can be set **per project** in a
+`.mcp.json` committed at the repository root — one store and one vocabulary
+per project, shared by everyone who checks the repo out.
+
+```json
+{
+  "mcpServers": {
+    "lemmalog": {
+      "command": "lemmalog-mcp",
+      "args": [],
+      "env": {
+        "LEMMALOG_MCP_PATH": ".lemmalog/memory.db",
+        "LEMMALOG_ONTOLOGY": "lemmalog.yaml",
+        "LEMMALOG_REPO": "."
+      }
+    }
+  }
+}
 ```
 
-**3. Verify before cutting over.**
+**Keep the paths relative.** They resolve against the directory the client
+launches the server in, which for a project-scoped `.mcp.json` is the
+project root. An absolute path committed to a shared file is somebody's
+home directory, and it is wrong for every other checkout — or, worse,
+right enough to point two projects at one store.
+
+Each variable does something different, and all three are worth setting:
+
+| Variable | What it pins |
+| --- | --- |
+| `LEMMALOG_MCP_PATH` | **Which store.** A path inside the project gives the project its own memory instead of one global store shared by everything. |
+| `LEMMALOG_ONTOLOGY` | **Which vocabulary.** A committed `lemmalog.yaml` is this project's relation set; unknown relations are rejected at write time rather than silently inventing meaning (see [`ontology.md`](ontology.md)). |
+| `LEMMALOG_REPO` | **What writes are stamped with.** `.` is this checkout, so `asserted_at_sha` / `asserted_on_branch` (§6) name the commit the fact was actually asserted at. |
+
+The CLI reads exactly the same variables, so a script run from the project
+root gets the same store and the same vocabulary as the MCP server:
 
 ```console
-$ LEMMALOG_MCP_PATH=new.db lemmalog-cli query --goal 'current(S, "owns", O)'
-S=svc:billing, O=table:invoices
-$ sqlite3 -header -column new.db "SELECT COUNT(*) AS edges FROM edges;"
-edges
------
-2
+$ LEMMALOG_MCP_PATH=.lemmalog/memory.db LEMMALOG_ONTOLOGY=lemmalog.yaml LEMMALOG_REPO=. \
+    lemmalog-cli observe --facts 'svc:x --owns--> table:y'
+added=1 updated=0 noop=0 escalations=0
+asserted_at_sha=7e0121f79105cbfdb025007a600526ba19a886ee asserted_on_branch=w44/feat/alt_storage fact_class=agent
 ```
 
-**4. Cut over.** Point `LEMMALOG_MCP_PATH` at the `.db` for every process
-(for the MCP server, the `--env LEMMALOG_MCP_PATH=...` in its registration)
-and restart them.
+An undeclared relation is refused by the project's own vocabulary, not by
+a global one:
 
-**5. Keep the snapshot.** It is the only copy of the pre-cutover state, and
-there is no way back from the `.db` other than another replay.
+```console
+$ LEMMALOG_MCP_PATH=.lemmalog/memory.db LEMMALOG_ONTOLOGY=lemmalog.yaml LEMMALOG_REPO=. \
+    lemmalog-cli observe --facts 'svc:x --frobnicates--> table:y'
+added=0 updated=0 noop=0 escalations=0 rejected=1
+asserted_at_sha=7e0121f79105cbfdb025007a600526ba19a886ee asserted_on_branch=w44/feat/alt_storage fact_class=agent
+rejected: svc:x --frobnicates--> table:y (unknown relation `frobnicates`)
+```
 
-What a replay does **not** carry over: closed (historical) edge versions,
-the original episode text, and per-fact assertion timestamps. Nor the
-original provenance — as the console output in step 2 shows, the replayed
-facts are stamped with the HEAD the *replay* ran on, not the one that first
-asserted them. The new store starts from "what is true now", re-asserted as
-of the replay instant. If that history matters, keep the snapshot file as
-the archive of it.
+Two decisions to make deliberately: whether `.lemmalog/` is committed or
+`.gitignore`d (committing it is §11), and whether `command` is a bare
+`lemmalog-mcp` on everyone's `PATH` or an absolute path to a build. The
+`.mcp.json` above is not a secret — it holds no credentials — but it does
+decide where every agent on the project writes.
+
+## 11. Sharing a store through git: the TSV round trip
+
+The snapshot backend is a tab-separated text file, so any non-SQLite
+extension gives you a text export. `.tsv` is the honest name for it:
+
+```console
+$ lemmalog-cli convert --from memory.db --to memory.tsv
+converted memory.db -> memory.tsv
+edges=3 other_base_facts=4 episodes=1 escalations=0 rule_batches=2
+
+$ head -4 memory.tsv
+LEMMALOG1
+NOW	1789937527
+RULES	
+RULEB	b1	reports_to(X,\sY)\s:-\scurrent(X,\s"manager",\sY).
+```
+
+and back again:
+
+```console
+$ lemmalog-cli convert --from memory.tsv --to rebuilt.db
+converted memory.tsv -> rebuilt.db
+edges=3 other_base_facts=4 episodes=1 escalations=0 rule_batches=2
+```
+
+The round trip is lossless in both directions — the exported text and a
+snapshot written directly hold the same line set:
+
+```console
+$ diff <(sort memory.snapshot) <(sort memory.tsv) && echo "IDENTICAL (line-set)"
+IDENTICAL (line-set)
+```
+
+**What it is for.** A `.db` is a binary blob: `git diff` says "Binary files
+differ" and review stops there. The TSV is reviewable — you can see in a
+merge request that one fact was added and which one — and it is greppable
+with `cut`, `grep` and `sort` without a SQLite client. That makes it the
+form to commit when a store is a shared artifact of the project rather than
+one agent's scratch memory: the `.db` for working, the `.tsv` for the
+history and the review.
+
+**The caveat, and it is the same one as §3.** The TSV is rewritten
+**whole** on every mutation, and line order follows an internal hash map,
+so a one-fact change does not produce a one-line diff:
+
+```console
+$ cp memory.tsv before.tsv
+$ LEMMALOG_MCP_PATH=memory.tsv lemmalog-cli observe --facts 'svc:orders --owns--> table:orders'
+added=1 updated=0 noop=0 escalations=0
+asserted_at_sha=7e0121f79105cbfdb025007a600526ba19a886ee asserted_on_branch=w44/feat/alt_storage fact_class=agent
+$ diff before.tsv memory.tsv
+2c2
+< NOW	1789937527
+---
+> NOW	1789937624
+6a7,11
+> EP	ep2	1789937624		svc:orders\s--owns-->\stable:orders
+> EPCTX	ep2	7e0121f79105cbfdb025007a600526ba19a886ee	w44/feat/alt_storage	agent
+> FACT	edge_evidence	1		s:svc:billing s:owns s:table:invoices s:ep1
+> FACT	edge_evidence	1		s:svc:billing s:depends_on s:svc:orders s:ep1
+> FACT	edge_evidence	1		s:job:invoice_export s:status s:running s:ep1
+9a15
+> FACT	edge	0.9	ep2	s:svc:orders s:owns s:table:orders i:1789937624 i:9223372036854775807 i:1789937624
+11,13d16
+< FACT	edge_evidence	1		s:svc:billing s:owns s:table:invoices s:ep1
+< FACT	edge_evidence	1		s:svc:billing s:depends_on s:svc:orders s:ep1
+< FACT	edge_evidence	1		s:job:invoice_export s:status s:running s:ep1
+```
+
+One new fact — two lines genuinely added (`EP ep2`, the new `FACT edge`)
+plus its episode context — and the diff also moves three unrelated
+`edge_evidence` lines from one end of the file to the other. It is
+**readable** — you can find the new records — but it is not minimal, and
+git will conflict on hunks that contain no real disagreement.
+
+So the TSV suits a **single writer**: one process (or one person) mutates
+the store and commits it, everyone else reads, and facts from others are
+handed to the writer rather than committed in parallel. It does not suit
+concurrent editing — two branches that both touched the store will conflict
+on lines neither of them meant to change, and resolving that conflict by
+hand means hand-editing bitemporal records. If more than one process needs
+to write, use the `.db` (§3) and export the TSV from it as a read-only
+artifact.

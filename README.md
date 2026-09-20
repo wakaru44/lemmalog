@@ -1,5 +1,34 @@
 # Lemmalog
 
+> **This is a fork of [JordyZomer/lemmalog](https://github.com/JordyZomer/lemmalog) (MIT).**
+>
+> Upstream is a consolidated project; this fork is an experiment, and we do not
+> upstream our changes. It exists to make the engine usable as a **shared,
+> months-long store for reverse-engineering a large legacy codebase** — several
+> agents and people, many branches, facts that must survive being wrong.
+>
+> What we add, and why upstream does not owe it to us:
+>
+> - **A SQLite store** (`--features sqlite`) replacing the single snapshot file,
+>   which is rewritten whole on every mutation — fatal for a shared, git-tracked
+>   store. See [`docs/storage.md`](docs/storage.md).
+> - **Three retraction reasons** instead of one. `wrong` (we misread) and
+>   `world_changed` (the code moved) have opposite consequences for everything
+>   derived from a fact; one `retract` cannot express that.
+> - **`suspect`** — a derived third state and a re-verification queue, for facts
+>   that were correct for an earlier period and are unverified now.
+> - **A declared ontology** ([`ontology.yaml`](ontology.yaml)), opt-in, replacing
+>   cardinality-by-relation-name-prefix. See [`docs/ontology.md`](docs/ontology.md).
+> - **Assertion provenance**: the commit, branch and class each fact was asserted
+>   under.
+>
+> Decisions and their rationale are in [`docs/adr/`](docs/adr/). ADR 1 is the
+> load-bearing one: the diff stays narrow and rebaseable, and we never touch
+> `src/eval.rs` or `src/magic.rs` — the evaluator is exactly what we want to keep
+> inheriting from upstream.
+>
+> Everything below this note is upstream's README.
+
 A Datalog engine for LLM agent memory. This repo contains the engine
 (Rust crate, MCP server, REPL, agent skill) plus the design document
 ([`datalog-context-engine-design.md`](datalog-context-engine-design.md),

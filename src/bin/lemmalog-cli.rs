@@ -13,6 +13,10 @@
 //!   lemmalog-cli why     --fact 'reports_to(alice, carol)'
 //!   lemmalog-cli rules   --rules 'reach(X,Z) :- current(X,"dep",Y), reach(Y,Z).'
 //!   lemmalog-cli dump    [--pred current]
+//!   lemmalog-cli convert --from memory.snapshot --to memory.db [--force]
+//!
+//! `convert` is the only subcommand that names its paths itself instead of
+//! reading LEMMALOG_MCP_PATH: it is the only one that touches two stores.
 //!
 //! Concurrency: load → mutate → save is atomic-rename, but the CLI and a
 //! live MCP server hold separate in-process copies — coordinate so only
@@ -482,10 +486,89 @@ fn main() {
                 }
             }
         }
+        // The one command that touches two stores, so the one command that
+        // does not go through `snap_path()`: every other subcommand resolves
+        // a single path from LEMMALOG_MCP_PATH, which cannot express
+        // "read backend A, write backend B". Each side picks its own backend
+        // from its own extension via the same `is_sqlite_store` the rest of
+        // the binary uses. `load` then `save` is lossless by construction —
+        // it moves the whole memory, not the `current` projection a
+        // dump-and-replay moves.
+        "convert" => {
+            let (Some(from), Some(to)) = (flag(&args, "--from"), flag(&args, "--to")) else {
+                eprintln!("lemmalog-cli: convert needs --from <path> --to <path>");
+                std::process::exit(2);
+            };
+            // Same refusal `snap_path()` makes, on both sides: never write a
+            // snapshot into a file whose name promises SQLite.
+            for (label, p) in [("--from", &from), ("--to", &to)] {
+                if is_sqlite_store(p) && !cfg!(feature = "sqlite") {
+                    eprintln!(
+                        "lemmalog-cli: {label} {p:?} names a SQLite store but this binary was \
+                         built without the `sqlite` feature.\n  rebuild: cargo build --release \
+                         --features mcp,sqlite"
+                    );
+                    std::process::exit(2);
+                }
+            }
+            // A missing source is an error, not "start fresh". An empty
+            // destination that exits 0 looks exactly like a successful
+            // migration, and that is the failure nobody checks.
+            if !std::path::Path::new(&from).exists() {
+                eprintln!("lemmalog-cli: --from {from:?} does not exist; nothing to convert");
+                std::process::exit(2);
+            }
+            if std::path::Path::new(&to).exists() && !args.iter().any(|a| a == "--force") {
+                eprintln!(
+                    "lemmalog-cli: --to {to:?} already exists.\n  Refusing to overwrite it: \
+                     convert writes the destination whole.\n  Move it aside, pick another path, \
+                     or pass --force."
+                );
+                std::process::exit(2);
+            }
+            // Same refusal the other subcommands make on an unreadable
+            // store, minus the "start fresh" branch: existence was already
+            // required above, so every error here is a real one.
+            let m = match store_load(&from) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!(
+                        "lemmalog-cli: --from {from:?} exists but could not be loaded ({e}).\n  \
+                         Refusing to run: nothing was written to {to:?}."
+                    );
+                    std::process::exit(3);
+                }
+            };
+            // What moved, so the operator can eyeball that nothing vanished.
+            // Base facts only — derived relations are not persisted by
+            // either backend, they are recomputed on load.
+            let edges = m.engine.relation_keys("edge").len();
+            let other: usize = m
+                .engine
+                .relations
+                .keys()
+                .filter(|p| *p != "edge" && !m.engine.clauses.iter().any(|c| c.head.pred == **p))
+                .map(|p| m.engine.relation_keys(p).len())
+                .sum();
+            if let Err(e) = store_save(&m, &to) {
+                eprintln!("lemmalog-cli: writing {to:?} failed ({e})");
+                std::process::exit(3);
+            }
+            println!("converted {from} -> {to}");
+            println!(
+                "edges={edges} other_base_facts={other} episodes={} escalations={} rule_batches={}",
+                m.episodes().len(),
+                m.escalations().len(),
+                m.rule_batches().len()
+            );
+        }
         other => {
             eprintln!(
-                "usage: lemmalog-cli observe|retract|suspects|reverify|query|context|why|rules|rmrules|batches|dump [flags]\n\
-                 flags: --facts|--goal|--query|--fact|--rules|--id|--pred|--ts|--budget|--reason|--by|--fact-class  (or stdin)\n\
+                "usage: lemmalog-cli observe|retract|suspects|reverify|query|context|why|rules|rmrules|batches|dump|convert [flags]\n\
+                 flags: --facts|--goal|--query|--fact|--rules|--id|--pred|--ts|--budget|--reason|--by|--fact-class|--from|--to|--force  (or stdin)\n\
+                 convert --from <path> --to <path> [--force] moves a whole store between backends\n\
+                   (each side's extension picks its backend; lossless — closed edges, episodes,\n\
+                    timestamps and provenance all survive; refuses an existing --to)\n\
                  observe --fact-class machine|agent|human (default agent) records how authoritative\n\
                    the facts are; HEAD of $LEMMALOG_REPO (default: cwd) is recorded with them\n\
                  retract --reason wrong (default: deletes, dependents die) | world_changed | superseded\n\
