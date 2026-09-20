@@ -1,0 +1,72 @@
+ontology.yaml
+  s_e6045d8ee74ea2::t_f17aa95c0b2cf3 1-386
+src/ontology.rs
+  s_e6045d8ee74ea2::t_534432be719e58 1-772
+src/storage/schema.sql
+  s_e6045d8ee74ea2::t_37037c05da3b5c 22-29
+  s_e6045d8ee74ea2::t_704bfd6f6c23de 37,43-46,52-55
+src/storage/mod.rs
+  s_e6045d8ee74ea2::t_aecd2ed8b91f30 277-279,282-286,292,294-295,297-302,306-309
+  s_e6045d8ee74ea2::t_c9d326f3cdfdde 15-18
+  s_e6045d8ee74ea2::t_e374d7046a3c19 167-191,193
+  s_e6045d8ee74ea2::t_449032374131a0 144-147
+  s_e6045d8ee74ea2::t_d45d7943ba53cf 36-46,50-54,56-95
+  s_e6045d8ee74ea2::t_81e2c1da6b183f 55
+  s_e6045d8ee74ea2::t_3726e3a4bafa0b 1-14,19,21-35,47-49,96-133,135-143,148-166,192,194-276,280-281,287-291,293,296,303-305,310-344,346-347,351-365,367-411,420-426,429-430,434,439,442,444-445,455,457,486,490,493,501,531,533-543
+  s_e6045d8ee74ea2::t_6bca6d9a1b0b59 20
+  s_e6045d8ee74ea2::t_029c96edc61cd3 134
+  s_e6045d8ee74ea2::t_600e03606a8e0e 345
+  s_e6045d8ee74ea2::t_7f9e154697a5a8 348-350
+  s_e6045d8ee74ea2::t_b56ff670584b23 366
+  s_e6045d8ee74ea2::t_f1e0496d3fa1b2 412-414,417-419
+  s_e6045d8ee74ea2::t_a4d016d8486c7a 427-428
+  s_e6045d8ee74ea2::t_bd298dbe3a14df 431-433
+  s_e6045d8ee74ea2::t_4db4aab0d026df 435-438
+  s_e6045d8ee74ea2::t_578c8fb1dc0d34 440-441
+  s_e6045d8ee74ea2::t_4b99ab30ec32a7 443
+  s_e6045d8ee74ea2::t_7f3f4e15d51b31 446-448,452-454
+  s_e6045d8ee74ea2::t_63c086134840c6 456
+  s_e6045d8ee74ea2::t_e623f20007149c 458-460,483-485
+  s_e6045d8ee74ea2::t_fc452ec3c08dd1 487-489
+  s_e6045d8ee74ea2::t_161933f1a6dae4 491-492
+  s_e6045d8ee74ea2::t_a6e8e3d8d330c5 494-496,498-500
+  s_e6045d8ee74ea2::t_6b17b6655ebb29 502-504,528-530
+  s_e6045d8ee74ea2::t_73e81375ead71c 532
+  s_36003b7d5718ea::t_10569debff3356 415-416,449-451,461-482,497,505-527
+tests/storage_roundtrip.rs
+  s_e6045d8ee74ea2::t_b5500fd716e1cb 1-372
+docs/ontology.md
+  s_e6045d8ee74ea2::t_996e5beec4ec2e 1-180
+src/agent.rs
+  s_e6045d8ee74ea2::t_1af0654d1e1c18 30-81
+  s_e6045d8ee74ea2::t_8e97d27a67c246 824-827,829-849,860,867,873-874,876-889
+  s_e6045d8ee74ea2::t_bc00015e4d7995 386-391,394-395,1200,1382-1462
+.gitignore
+  s_e6045d8ee74ea2::t_ac9deec6f62f2d 21
+src/lib.rs
+  s_e6045d8ee74ea2::t_24e2ee93e261db 38,42-43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "03fa09ed089888e7a35b172e4cbe7893f0eee95b",
+  "prompts": {},
+  "sessions": {
+    "s_36003b7d5718ea": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a02bf4211694b94c0",
+        "model": "unknown"
+      },
+      "human_author": "Wakaru Himura <wakaru44@gmail.com>"
+    },
+    "s_e6045d8ee74ea2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcbf69c7-331f-48cd-9532-bb93ed8b4605",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Wakaru Himura <wakaru44@gmail.com>"
+    }
+  }
+}
