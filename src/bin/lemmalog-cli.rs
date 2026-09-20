@@ -6,7 +6,7 @@
 //!
 //!   lemmalog-cli observe  --facts 'alice --works_at--> acme'
 //!   lemmalog-cli query   --goal 'current("alice", R, O)'
-//!   lemmalog-cli retract --facts 'alice --works_at--> acme' [--reason world_changed]
+//!   lemmalog-cli retract --facts 'alice --works_at--> acme' [--reason world_changed] [--by agent-7]
 //!   lemmalog-cli suspects
 //!   lemmalog-cli reverify --facts 'alice --manager--> bob'
 //!   lemmalog-cli context --query 'where does alice work'
@@ -225,7 +225,20 @@ fn main() {
                 },
             };
             let text = stdin_or_flag(&args, "--facts");
-            let (done, missing, died) = m.retract_facts_because(&text, reason, None);
+            // `--by` is the retractor identity; absent, `None` keeps the
+            // `retracted_by` column NULL exactly as before.
+            let by = flag(&args, "--by");
+            // `wrong` deletes the row, so there is no surviving fact to hang a
+            // retractor on. Say so instead of dropping `--by` on the floor.
+            if by.is_some() && reason == RetractReason::Wrong {
+                eprintln!(
+                    "lemmalog-cli: warning: --by is ignored with --reason wrong: the fact was \
+                     never true, so the row is deleted and nothing survives to record the \
+                     retractor. Use --reason world_changed to keep the earlier period true and \
+                     record the retractor in edges.retracted_by."
+                );
+            }
+            let (done, missing, died) = m.retract_facts_because(&text, reason, by.as_deref());
             // The closure markers only become facts the `suspect` rules can
             // join on when `maintain` lifts them out of provenance.
             if reason != RetractReason::Wrong {
@@ -235,8 +248,11 @@ fn main() {
             println!("retracted {} fact(s)", done.len());
             if reason != RetractReason::Wrong {
                 println!(
-                    "reason={}; {} fact(s) now suspect (see: lemmalog-cli suspects)",
+                    "reason={}{}; {} fact(s) now suspect (see: lemmalog-cli suspects)",
                     reason.as_str(),
+                    // the library scrubs commas out of `by` before it reaches
+                    // provenance; echo what was asked for
+                    by.as_deref().map(|b| format!(" by={b}")).unwrap_or_default(),
                     m.reverification_queue().len()
                 );
             }
@@ -378,8 +394,9 @@ fn main() {
         other => {
             eprintln!(
                 "usage: lemmalog-cli observe|retract|suspects|reverify|query|context|why|rules|rmrules|batches|dump [flags]\n\
-                 flags: --facts|--goal|--query|--fact|--rules|--id|--pred|--ts|--budget|--reason  (or stdin)\n\
+                 flags: --facts|--goal|--query|--fact|--rules|--id|--pred|--ts|--budget|--reason|--by  (or stdin)\n\
                  retract --reason wrong (default: deletes, dependents die) | world_changed | superseded\n\
+                 retract --by <who> records the retractor (edges.retracted_by); omitted = unrecorded\n\
                    (world_changed/superseded close the fact in valid time and mark dependents\n\
                     suspect — list them with `suspects`, clear them with `reverify`)\n\
                  unknown command {other:?}"

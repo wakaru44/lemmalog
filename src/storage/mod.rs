@@ -266,6 +266,14 @@ pub fn save<X: Extractor>(m: &AgentMemory<X>, path: &str) -> Res<()> {
     }
 
     tx.commit()?;
+    // Test-only fault injection (tests/crash_consistency.rs): die in the
+    // window between the commit and the checkpoint, the only place a crash
+    // can leave the bare `.db` short of a save that already succeeded.
+    // There is no other way to enter that window deterministically. Inert
+    // unless the variable is set, which no binary or library path sets.
+    if std::env::var_os("LEMMALOG_CRASH_AFTER_COMMIT").is_some() {
+        std::process::abort();
+    }
     // Only now, with the write durably committed: fold the WAL back into
     // the main file so `store.db` is complete on its own. Without this, an
     // operator who copies/backs up/commits just the `.db` — leaving the

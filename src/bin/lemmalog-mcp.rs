@@ -166,7 +166,7 @@ fn tools() -> J {
         tool("lemmalog_observe",
             "Assert facts into memory (host model does extraction). Input: facts in the line protocol 'S --rel[conf]--> O', one per line; optional ts integer = the facts' valid-from time (default: now). Backdating with ts is safe: it sets valid-time only, never the clock reads use. Example: 'Alice --works_at--> Acme\\nBob --manager--> Carol'.", &["facts", "ts"], &["facts"]),
         tool("lemmalog_retract",
-            "Retract facts (line protocol, same as observe). Optional `reason` (default 'wrong'): 'wrong' = we misread, it was never true — the row is deleted and everything derived from it dies; 'world_changed' = it WAS true until now — the row is closed in valid time, the earlier period stays true, and what rests on it becomes SUSPECT (see lemmalog_suspects) rather than dying; 'superseded' = an exclusive relation took a new value. The response reports which derived facts died.", &["facts", "reason"], &["facts"]),
+            "Retract facts (line protocol, same as observe). Optional `reason` (default 'wrong'): 'wrong' = we misread, it was never true — the row is deleted and everything derived from it dies; 'world_changed' = it WAS true until now — the row is closed in valid time, the earlier period stays true, and what rests on it becomes SUSPECT (see lemmalog_suspects) rather than dying; 'superseded' = an exclusive relation took a new value. Optional `by` = who is retracting, recorded as the fact's retractor. The response reports which derived facts died.", &["facts", "reason", "by"], &["facts"]),
         tool("lemmalog_suspects",
             "The re-verification queue: facts that are neither true nor false. Something each one rests on stopped being true because the world moved on, so it was correct for an earlier period and nobody has checked it against current reality since. Returns each suspect fact, the support that was closed, when, and why. Don't answer from these; go re-read the evidence. Clearing one takes lemmalog_reverify — re-verification at confidence 1.0 against evidence you have just re-read, never a re-assertion from memory or inference.", &[], &[]),
         tool("lemmalog_reverify",
@@ -223,6 +223,7 @@ fn prop_desc(p: &str) -> &'static str {
         "budget_tokens" => "context token budget",
         "since" => "epoch checkpoint",
         "reason" => "wrong | world_changed | superseded",
+        "by" => "who is retracting",
         _ => "",
     }
 }
@@ -452,7 +453,11 @@ fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Res
                 // invalidation is computed against the derived view, so the
                 // clock has to be current before we decide what dies
                 sync_clock(state);
-                let (done, missing, died) = state.memory.retract_facts_because(facts, reason, None);
+                // `by` is optional; absent it stays `None` and the
+                // retractor is simply not recorded, as before.
+                let by = args["by"].as_str().map(str::trim).filter(|b| !b.is_empty());
+                let (done, missing, died) =
+                    state.memory.retract_facts_because(facts, reason, by);
                 // only `maintain` lifts the closure markers into the base
                 // facts the `suspect` rules join on
                 let suspect = if reason == RetractReason::Wrong {
@@ -481,9 +486,12 @@ fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Res
                     }
                     if let Some(n) = suspect {
                         out.push_str(&format!(
-                            "  reason={}: the earlier period stays true; {n} fact(s) now suspect \
-                             (lemmalog_suspects)\n",
-                            reason.as_str()
+                            "  reason={}{}: the earlier period stays true; {n} fact(s) now \
+                             suspect (lemmalog_suspects)\n",
+                            reason.as_str(),
+                            // the library scrubs commas out of `by` on the way
+                            // into provenance; echo what was asked for
+                            by.map(|b| format!(" by={b}")).unwrap_or_default()
                         ));
                     }
                 }
@@ -497,6 +505,18 @@ fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Res
                     out.push_str(
                         "nothing retracted — every line failed to parse \
 (strict validation: S --rel--> O with real entity names)",
+                    );
+                }
+                // `wrong` deletes the row, so there is no surviving fact to
+                // hang a retractor on. Say so instead of dropping `by`.
+                if by.is_some() && reason == RetractReason::Wrong {
+                    if !out.is_empty() && !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    out.push_str(
+                        "note: `by` is ignored with reason=wrong: the fact was never true, so \
+the row is deleted and nothing survives to record the retractor. Use reason=world_changed to \
+keep the earlier period true and record the retractor.\n",
                     );
                 }
                 Ok(out)
