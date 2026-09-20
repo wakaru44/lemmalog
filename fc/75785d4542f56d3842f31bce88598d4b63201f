@@ -1,0 +1,48 @@
+src/storage/schema.sql
+  s_e6045d8ee74ea2::t_96f7543ae3282f 106-111,113-121
+src/storage/mod.rs
+  s_e6045d8ee74ea2::t_3d6f65dffc3799 100,103-105
+  s_e6045d8ee74ea2::t_d8edbef600b032 241-255,268-272
+  s_e6045d8ee74ea2::t_668c0425c30566 16-17
+  s_e6045d8ee74ea2::t_fe2bcffa770d1d 370-378,380-395,397-403
+  s_e6045d8ee74ea2::t_fe3e2570161ce8 437,441
+  s_e6045d8ee74ea2::t_888a3f105b37c6 446,448
+  s_e6045d8ee74ea2::t_6eedbab6b2abf0 418
+  s_e6045d8ee74ea2::t_62bc05005bc2ee 490
+  s_e6045d8ee74ea2::t_e4471bf037ed02 952-1140
+  s_e6045d8ee74ea2::t_a5e2f308961a2b 27-29
+  s_e6045d8ee74ea2::t_8bd1464f3feb7b 65-68,70,78-79,87-89,91,95,98
+  s_e6045d8ee74ea2::t_867513f94d0bfa 183-186,188-198
+  s_e6045d8ee74ea2::t_03fcea6bd09ba0 209-211
+src/agent.rs
+  s_e6045d8ee74ea2::t_60e5d96983533e 1814-1826
+  s_e6045d8ee74ea2::t_8cea65add03de0 566-618
+  s_e6045d8ee74ea2::t_f75fdd68b9ca52 721
+  s_e6045d8ee74ea2::t_9b7a225584eec1 68-114,2559
+  s_e6045d8ee74ea2::t_275f7cfbbea092 1215
+  s_e6045d8ee74ea2::t_b694fca8ed325c 123-129
+  s_e6045d8ee74ea2::t_64725da94a08fe 1879
+  s_e6045d8ee74ea2::t_d7d0015e5d00bc 1914-1931
+  s_e6045d8ee74ea2::t_74c9389ed6b998 1975
+  s_e6045d8ee74ea2::t_ddd905889d3b26 2513-2517
+  s_e6045d8ee74ea2::t_b8ada80c8f4df9 2518-2558
+  s_e6045d8ee74ea2::t_5c72e5f8dc2d50 555-556
+  s_e6045d8ee74ea2::t_6f0aa5aa2688f1 471-482
+  s_e6045d8ee74ea2::t_5f4d575e89e0e0 745
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "fc75785d4542f56d3842f31bce88598d4b63201f",
+  "prompts": {},
+  "sessions": {
+    "s_e6045d8ee74ea2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcbf69c7-331f-48cd-9532-bb93ed8b4605",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Wakaru Himura <wakaru44@gmail.com>"
+    }
+  }
+}
