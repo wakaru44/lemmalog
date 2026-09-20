@@ -19,7 +19,14 @@ CREATE TABLE IF NOT EXISTS edges (
   id                 INTEGER PRIMARY KEY,
   subject            TEXT    NOT NULL,
   predicate          TEXT    NOT NULL,
-  object             TEXT    NOT NULL,
+  -- The object is the one edge slot that need not be a symbol: an edge can
+  -- point at a number. Same one-of-two shape as `fact_args`, so that
+  -- `edges` is the COMPLETE edge set and SQL never has to union in `facts`
+  -- to see them all. Subject and predicate are always symbols.
+  object_kind        TEXT    NOT NULL DEFAULT 'sym'
+                     CHECK (object_kind IN ('sym','int')),
+  object             TEXT,
+  object_int         INTEGER,
 
   valid_from         INTEGER NOT NULL,
   valid_to           INTEGER NOT NULL,
@@ -27,18 +34,25 @@ CREATE TABLE IF NOT EXISTS edges (
 
   confidence         REAL    NOT NULL CHECK (confidence BETWEEN 0.0 AND 1.0),
 
-  -- additive, ours; all nullable so phase 1 writes none of them
+  -- additive, ours
   asserted_at_sha    TEXT,
   asserted_on_branch TEXT,
   bounded_by         TEXT,
   fact_class         TEXT    NOT NULL DEFAULT 'agent'
                      CHECK (fact_class IN ('machine','agent','human')),
+  -- Why the edge stopped being asserted. 'wrong' never reaches the store
+  -- (a wrong fact is deleted, it was never true); 'world_changed' and
+  -- 'superseded' close `valid_to` and keep the row, which is what makes
+  -- "true until when, and why not now" answerable in SQL.
   retract_reason     TEXT    CHECK (retract_reason IN
                                    ('wrong','world_changed','superseded')),
   retracted_at       INTEGER,
   retracted_by       TEXT,
 
-  UNIQUE (subject, predicate, object, valid_from, valid_to, asserted_at)
+  CHECK ((object_kind = 'sym' AND object IS NOT NULL AND object_int IS NULL)
+      OR (object_kind = 'int' AND object_int IS NOT NULL AND object IS NULL)),
+  UNIQUE (subject, predicate, object_kind, object, object_int,
+          valid_from, valid_to, asserted_at)
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS edges_spo      ON edges (subject, predicate, object);

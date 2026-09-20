@@ -27,6 +27,58 @@ pub struct Episode {
     pub speaker: Option<String>,
 }
 
+/// Why a fact stopped being asserted. The distinction is load-bearing:
+/// a fact we misread was never true, so everything derived from it is
+/// wrong too; a fact the world changed under *was* true until a point,
+/// so its dependents stay true for that earlier period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetractReason {
+    /// We misread. The fact was NEVER valid: the edge is removed and
+    /// dependents die.
+    Wrong,
+    /// The world moved on. The fact WAS true until the retraction
+    /// instant: the edge stays, with `valid_to` closed there.
+    WorldChanged,
+    /// An exclusive relation got a new value — what `apply_update` does
+    /// when it closes the previous open edge.
+    Superseded,
+}
+
+impl RetractReason {
+    /// The `edges.retract_reason` CHECK vocabulary, verbatim.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RetractReason::Wrong => "wrong",
+            RetractReason::WorldChanged => "world_changed",
+            RetractReason::Superseded => "superseded",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<RetractReason> {
+        match s {
+            "wrong" => Some(RetractReason::Wrong),
+            "world_changed" => Some(RetractReason::WorldChanged),
+            "superseded" => Some(RetractReason::Superseded),
+            _ => None,
+        }
+    }
+}
+
+// A closed edge carries its retraction metadata in the provenance set:
+// the engine stores only (key, Ann), and provenance is the one part of a
+// fact meant to say where it came from. `storage` lifts these three
+// markers back out into real `edges` columns and rebuilds them on load,
+// so the marker <-> column mapping is a bijection.
+pub const RETRACT_PROV: &str = "retract:";
+pub const RETRACTED_AT_PROV: &str = "retracted_at:";
+pub const RETRACTED_BY_PROV: &str = "retracted_by:";
+
+/// Provenance is joined with commas by the snapshot format, so a comma in
+/// a caller-supplied retractor name would split into two prov entries.
+fn clean_prov(s: &str) -> String {
+    s.replace(',', " ")
+}
+
 /// One candidate fact produced by extraction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CandidateFact {
@@ -331,13 +383,16 @@ pub struct IngestReport {
 pub struct AgentMemory<X: Extractor> {
     pub engine: Engine,
     extractor: X,
-    episodes: Vec<Episode>,
-    escalations: Vec<String>,
-    episode_counter: u64,
+    // pub(crate) so `crate::storage` can persist these without the whole
+    // SQLite backend living in this file (ADR 1: keep the diff narrow and
+    // rebaseable -- a new module cannot conflict, a fattened one will).
+    pub(crate) episodes: Vec<Episode>,
+    pub(crate) escalations: Vec<String>,
+    pub(crate) episode_counter: u64,
     /// Epoch of the last completed `maintain()`; `context()` reports
     /// memory changes since then.
-    last_turn_epoch: u64,
-    extra_rules: String,
+    pub(crate) last_turn_epoch: u64,
+    pub(crate) extra_rules: String,
     hyp_counter: u64,
 }
 
@@ -766,13 +821,32 @@ impl<X: Extractor> AgentMemory<X> {
         r.render(&sel)
     }
 
-    /// Retract base facts given in the line protocol. Each open `edge`
-    /// row matching (S, R, O) is removed; `maintain()` then recomputes
-    /// the transitive dependents (scoped negative delta). Returns
-    /// (retracted lines, not-found lines, derived facts that died) —
-    /// the consequence report is the point: the caller sees exactly
-    /// what invalidation propagated.
+    /// Retract base facts given in the line protocol, as [`RetractReason::Wrong`]
+    /// — we misread, the fact was never valid, so the row goes and its
+    /// dependents die with it. See [`AgentMemory::retract_facts_because`] for
+    /// the other two reasons.
     pub fn retract_facts(&mut self, text: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+        self.retract_facts_because(text, RetractReason::Wrong, None)
+    }
+
+    /// Retract base facts given in the line protocol, recording WHY.
+    ///
+    /// Each open `edge` row matching (S, R, O) stops being current;
+    /// `maintain()` then recomputes the transitive dependents (scoped
+    /// negative delta). What happens to the row depends on the reason:
+    /// `Wrong` removes it (it was never true), `WorldChanged` and
+    /// `Superseded` close its `valid_to` at the engine clock, so the
+    /// earlier period — and whatever was derived over it — stays true.
+    ///
+    /// Returns (retracted lines, not-found lines, derived facts that died)
+    /// — the consequence report is the point: the caller sees exactly
+    /// what invalidation propagated.
+    pub fn retract_facts_because(
+        &mut self,
+        text: &str,
+        reason: RetractReason,
+        by: Option<&str>,
+    ) -> (Vec<String>, Vec<String>, Vec<String>) {
         let candidates = parse_protocol_strict(text, 0.9);
         let mut done = Vec::new();
         let mut missing = Vec::new();
@@ -783,22 +857,36 @@ impl<X: Extractor> AgentMemory<X> {
                 Ok(n) => Value::Int(n),
                 Err(_) => self.engine.sym(&c.obj),
             };
-            let open: Vec<Vec<Value>> = self
+            let open: Vec<(Vec<Value>, Ann)> = self
                 .engine
                 .query(
                     "edge",
                     &[Some(subj), Some(pred), Some(obj), None, None, None],
                 )
                 .into_iter()
-                .map(|(k, _)| k)
-                .filter(|k| matches!(k[4].as_int(), Some(vt) if vt == i64::MAX))
+                .filter(|(k, _)| matches!(k[4].as_int(), Some(vt) if vt == i64::MAX))
                 .collect();
             if open.is_empty() {
                 missing.push(format!("{} --{}--> {}", c.subj, c.pred, c.obj));
                 continue;
             }
-            for row in &open {
+            let at = self.engine.now;
+            for (row, ann) in &open {
                 self.engine.retract("edge", row);
+                if reason == RetractReason::Wrong {
+                    continue;
+                }
+                // keep the history: same row, closed at `at`, carrying its
+                // original annotation plus the retraction markers
+                let mut closed = row.clone();
+                closed[4] = Value::Int(at);
+                let mut ann = ann.clone();
+                ann.prov.insert(format!("{RETRACT_PROV}{}", reason.as_str()));
+                ann.prov.insert(format!("{RETRACTED_AT_PROV}{at}"));
+                if let Some(by) = by {
+                    ann.prov.insert(format!("{RETRACTED_BY_PROV}{}", clean_prov(by)));
+                }
+                self.engine.declare("edge", &closed, ann);
             }
             done.push(format!("{} --{}--> {}", c.subj, c.pred, c.obj));
         }
@@ -1109,7 +1197,7 @@ fn unesc(s: &str) -> String {
 
 const SNAPSHOT_MAGIC: &str = "LEMMALOG1";
 /// The batch `new()` installs from `DEFAULT_RULES`; never persisted.
-const BOOTSTRAP_BATCH: &str = "b0";
+pub(crate) const BOOTSTRAP_BATCH: &str = "b0";
 /// Pre-rename snapshots (read-only compatibility).
 const SNAPSHOT_MAGIC_V0: &str = "CORTEXLOG1";
 
@@ -1289,5 +1377,86 @@ impl<X: Extractor> AgentMemory<X> {
         let _ = m.engine.run();
         m.last_turn_epoch = m.engine.epoch();
         Ok(m)
+    }
+}
+
+#[cfg(test)]
+mod retract_reason_tests {
+    use super::*;
+
+    /// A memory with one rule that reads the edge's *interval*, not the
+    /// clock: it says "this was true at t=150" regardless of what is
+    /// current. That is the only way to see the difference between a fact
+    /// that was never true and one that stopped being true.
+    fn memory() -> AgentMemory<MockExtractor> {
+        let mut m = AgentMemory::new(
+            MockExtractor::new(0.9),
+            "held_at_150(E,R,O) :- edge(E,R,O,VF,VT,_), VF =< 150, 150 < VT.",
+        )
+        .expect("new memory");
+        m.observe_extracted("alice --lives_in--> berlin", 100);
+        m.maintain(100);
+        assert_eq!(
+            m.engine.relation_keys("held_at_150").len(),
+            1,
+            "fixture must derive the earlier-period view"
+        );
+        m
+    }
+
+    #[test]
+    fn world_changed_closes_the_interval_and_keeps_the_earlier_period() {
+        let mut m = memory();
+        m.engine.set_now(200);
+        let (done, missing, died) = m.retract_facts_because(
+            "alice --lives_in--> berlin",
+            RetractReason::WorldChanged,
+            Some("agent-7"),
+        );
+        assert_eq!(done.len(), 1);
+        assert!(missing.is_empty());
+
+        let edges = m.engine.relation_keys("edge");
+        assert_eq!(edges.len(), 1, "the edge must survive, not be deleted");
+        assert_eq!(edges[0][4], Value::Int(200), "valid_to closed at `now`");
+        assert!(
+            m.engine.relation_keys("current").is_empty(),
+            "a closed edge is not current any more"
+        );
+        assert_eq!(
+            m.engine.relation_keys("held_at_150").len(),
+            1,
+            "what was derived over the earlier period stays true"
+        );
+        assert!(
+            !died.iter().any(|d| d.contains("held_at_150")),
+            "the earlier-period dependent must not be reported dead: {died:?}"
+        );
+
+        let prov = &m.engine.relations["edge"].rows[0].fact.ann.prov;
+        assert!(prov.contains("ep1"), "original provenance is kept: {prov:?}");
+        assert!(prov.contains("retract:world_changed"));
+        assert!(prov.contains("retracted_at:200"));
+        assert!(prov.contains("retracted_by:agent-7"));
+    }
+
+    #[test]
+    fn wrong_deletes_the_edge_and_kills_the_earlier_period() {
+        let mut m = memory();
+        m.engine.set_now(200);
+        let (done, _, died) = m.retract_facts("alice --lives_in--> berlin");
+        assert_eq!(done.len(), 1);
+        assert!(
+            m.engine.relation_keys("edge").is_empty(),
+            "a fact that was never true leaves no row"
+        );
+        assert!(
+            m.engine.relation_keys("held_at_150").is_empty(),
+            "dependents of a never-true fact die with it"
+        );
+        assert!(
+            died.iter().any(|d| d.contains("held_at_150")),
+            "the dead dependent must be reported: {died:?}"
+        );
     }
 }

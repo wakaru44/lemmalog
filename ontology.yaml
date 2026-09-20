@@ -1,0 +1,386 @@
+# lemmalog ontology — declared relation vocabulary
+#
+# Source of truth for what a relation MEANS to the update policy:
+# how many values may be open at once (cardinality), what kinds of
+# entity may sit either side (domain/range), and whether asserting it
+# obliges a sibling `evidence` fact.
+#
+# STATUS: DESIGN ONLY. Nothing reads this file yet. The engine still
+# decides cardinality by prefix match in `apply_update` (src/agent.rs).
+# See docs/ontology.md for the mapping and the migration note.
+
+version: 1
+
+policy:
+  # Unknown RELATIONS are rejected at write time. A relation is the unit
+  # of meaning the update policy acts on; inventing one silently is how
+  # you get a fact that supersedes something it should have accumulated
+  # next to. Adding a relation is a deliberate edit to this file.
+  unknown_relations: reject
+
+  # Unknown ENTITY KINDS are accepted and flagged. The vocabulary of a
+  # system under investigation is genuinely open — you meet a new kind of
+  # thing mid-trace and must be able to record it immediately. Blocking
+  # would stall the investigation for a namespace prefix nobody can name
+  # yet. The write succeeds and the unknown kind is reported so it can be
+  # promoted into `entity_kinds` (or corrected) later.
+  unknown_entity_kinds: accept_and_flag
+
+  # Entity kinds are read as the `prefix:` segment of a subject/object
+  # symbol. A symbol with no recognised prefix is `untyped` and matches
+  # any domain/range that lists `any`.
+  untyped_symbols: allow
+
+  # `requires_evidence` violations are reported, not rejected: the
+  # evidence fact often lands in the same batch, a moment after.
+  missing_evidence: warn
+
+# ---------------------------------------------------------------------
+# Entity kinds — the namespace prefixes a symbol may carry.
+# `table:orders`, `class:InvoiceBuilder`, `term:dunning`.
+# ---------------------------------------------------------------------
+entity_kinds:
+  table:
+    description: A persisted relation in a datastore — a database table or view.
+  entity:
+    description: A domain concept as the business talks about it, independent of any table or class that stores it.
+  class:
+    description: A named type in source code — class, struct or equivalent.
+  method:
+    description: A callable — method, function or procedure, qualified by its owner where ambiguous.
+  module:
+    description: A deployable or navigable unit of code — package, service, directory or namespace.
+  enum:
+    description: A closed set of allowed values, or one member of such a set.
+  term:
+    description: A word of the system's vocabulary whose meaning is contested, overloaded or non-obvious.
+  question:
+    description: An open investigation item — something not yet known, tracked so it is not silently dropped.
+  doc:
+    description: A document, ticket, specification or other written artefact used as a citation.
+  literal:
+    description: Not a namespaced entity — a bare value, string or number sitting on the object side.
+  any:
+    description: Pseudo-kind used in domain/range to mean "no constraint declared".
+
+# ---------------------------------------------------------------------
+# Relations.
+#
+#   cardinality: single       -> one open value; a new value supersedes
+#                                the last (old edge's valid_to closes).
+#                single_per_subject_pair is NOT modelled: keep it simple.
+#   cardinality: accumulating -> many values coexist; new ones add.
+#   domain / range            -> permitted entity kinds either side.
+#   requires_evidence         -> asserting it obliges a sibling
+#                                `evidence` fact on the same subject.
+#   legacy                    -> how the current prefix heuristic in
+#                                src/agent.rs classifies this name today.
+# ---------------------------------------------------------------------
+relations:
+
+  # --- provenance and annotation -------------------------------------
+  evidence:
+    cardinality: accumulating
+    domain: [any]
+    range: [doc, literal]
+    requires_evidence: false
+    description: Cites where a claim came from — a file, line, ticket or query result.
+    legacy: {array: MULTI, prefix: evidence}
+
+  source:
+    cardinality: accumulating
+    domain: [any]
+    range: [doc, module, literal]
+    requires_evidence: false
+    description: Names the origin a fact was read out of, coarser than a single citation.
+    legacy: {array: MULTI, prefix: source}
+
+  cites:
+    cardinality: accumulating
+    domain: [any]
+    range: [doc, literal]
+    requires_evidence: false
+    description: References an external document that supports or contextualises the subject.
+    legacy: {array: MULTI, prefix: cites}
+
+  mentions:
+    cardinality: accumulating
+    domain: [doc, any]
+    range: [any]
+    requires_evidence: false
+    description: The subject names the object somewhere, without asserting any stronger relationship.
+    legacy: {array: MULTI, prefix: mentions}
+
+  describes:
+    cardinality: accumulating
+    domain: [doc, method, module, class]
+    range: [any]
+    requires_evidence: false
+    description: The subject explains or documents the object.
+    legacy: {array: MULTI, prefix: describes}
+
+  tag:
+    cardinality: accumulating
+    domain: [any]
+    range: [term, literal]
+    requires_evidence: false
+    description: An informal label attached for retrieval; carries no semantics of its own.
+    legacy: {array: MULTI, prefix: tag}
+
+  # --- structure -----------------------------------------------------
+  part_of:
+    cardinality: accumulating
+    domain: [any]
+    range: [module, entity, class]
+    requires_evidence: false
+    description: The subject is a component of the object; a thing may belong to more than one whole.
+    legacy: {array: MULTI, prefix: part_of}
+
+  owns:
+    cardinality: accumulating
+    domain: [module, class, entity]
+    range: [any]
+    requires_evidence: false
+    description: The subject is responsible for the object's lifecycle or correctness.
+    legacy: {array: MULTI, prefix: owns}
+
+  depends_on:
+    cardinality: accumulating
+    domain: [module, class, method, entity]
+    range: [module, class, method, entity, table]
+    requires_evidence: false
+    description: The subject cannot function without the object.
+    legacy: {array: MULTI, prefix: depends_on}
+
+  related_to:
+    cardinality: accumulating
+    domain: [any]
+    range: [any]
+    requires_evidence: false
+    description: Deliberately weak association; use a sharper relation as soon as one fits.
+    legacy: {array: MULTI, prefix: related_to}
+
+  located:
+    cardinality: accumulating
+    domain: [any]
+    range: [module, doc, literal]
+    requires_evidence: false
+    description: Where the subject is found — file path, module or physical place.
+    legacy: {array: MULTI, prefix: located}
+
+  stored_in:
+    cardinality: accumulating
+    domain: [entity, enum, term]
+    range: [table]
+    requires_evidence: true
+    description: The concept's data lives in this table; one concept is commonly split across several.
+
+  # --- code behaviour ------------------------------------------------
+  calls:
+    cardinality: accumulating
+    domain: [method, module, class]
+    range: [method, module]
+    requires_evidence: false
+    description: The subject invokes the object at runtime.
+    legacy: {array: MULTI, prefix: calls}
+
+  exposes:
+    cardinality: accumulating
+    domain: [module, class]
+    range: [method]
+    requires_evidence: false
+    description: The subject makes the object reachable from outside its own boundary.
+
+  declared_by:
+    cardinality: accumulating
+    domain: [table, class, enum, method]
+    range: [doc, module, literal]
+    requires_evidence: true
+    description: Where the subject's definition is authored — migration, schema file or declaration site.
+
+  writes_table:
+    cardinality: accumulating
+    domain: [method, module, class]
+    range: [table]
+    requires_evidence: true
+    description: The subject inserts, updates or deletes rows in the object table.
+
+  reads_table:
+    cardinality: accumulating
+    domain: [method, module, class]
+    range: [table]
+    requires_evidence: true
+    description: The subject selects from the object table.
+
+  represents:
+    cardinality: accumulating
+    domain: [table, class, enum]
+    range: [entity, term]
+    requires_evidence: false
+    description: The subject is one concrete encoding of the object concept; a concept may have several.
+
+  purpose:
+    cardinality: single
+    domain: [any]
+    range: [literal]
+    requires_evidence: false
+    description: One sentence on what the subject is for; a better sentence supersedes the previous one.
+
+  # --- state machinery -----------------------------------------------
+  owns_status:
+    cardinality: accumulating
+    domain: [table, class, module]
+    range: [enum, term]
+    requires_evidence: true
+    description: The subject is the authoritative home of the named status value.
+    legacy:
+      array: MULTI
+      prefix: owns
+      note: matched `owns` by prefix, which happened to be right; nothing guaranteed it.
+
+  sets_status:
+    cardinality: accumulating
+    domain: [method, module]
+    range: [enum, term]
+    requires_evidence: true
+    description: The subject writes the named status value.
+    legacy:
+      array: none
+      note: matched no prefix today, so a second value escalates as a conflict instead of accumulating.
+
+  reads_status:
+    cardinality: accumulating
+    domain: [method, module]
+    range: [enum, term]
+    requires_evidence: true
+    description: The subject branches on the named status value.
+    legacy:
+      array: none
+      note: matched no prefix today; same false conflict as sets_status.
+
+  status:
+    cardinality: single
+    domain: [any]
+    range: [enum, term, literal]
+    requires_evidence: false
+    description: The subject's current state; asserting a new one closes the old.
+    legacy:
+      array: FUNCTIONAL
+      prefix: status
+      note: the prefix also swallows any relation merely starting with "status" (status_code, status_source).
+
+  # --- naming and ambiguity ------------------------------------------
+  aka:
+    cardinality: accumulating
+    domain: [any]
+    range: [term, literal]
+    requires_evidence: false
+    description: Another name the same thing goes by.
+    legacy: {array: MULTI, prefix: aka}
+
+  alias_of:
+    cardinality: accumulating
+    domain: [any]
+    range: [any]
+    requires_evidence: false
+    description: The subject is a second name for the object, which is the preferred one.
+    legacy: {array: MULTI, prefix: alias_of}
+
+  confusable_with:
+    cardinality: accumulating
+    domain: [term, table, entity, class]
+    range: [term, table, entity, class]
+    requires_evidence: true
+    description: Two similarly named things that are not the same; recorded so the next reader does not merge them.
+
+  refers_to:
+    cardinality: accumulating
+    domain: [term, doc, literal]
+    range: [any]
+    requires_evidence: false
+    description: In the observed usage, the subject name means the object.
+
+  # --- disagreement and open work ------------------------------------
+  conflicts_with:
+    cardinality: accumulating
+    domain: [any]
+    range: [any]
+    requires_evidence: true
+    description: Two claims that cannot both hold; kept side by side until one is retracted.
+
+  symptom_of:
+    cardinality: accumulating
+    domain: [any]
+    range: [any]
+    requires_evidence: false
+    description: The subject is an observable effect of the object cause.
+    legacy: {array: MULTI, prefix: symptom_of}
+
+  open_question:
+    cardinality: accumulating
+    domain: [any]
+    range: [question, literal]
+    requires_evidence: false
+    description: Something still unknown about the subject, parked where it will be found again.
+
+  # --- scalar attributes (single-valued) ------------------------------
+  version:
+    cardinality: single
+    domain: [module, class, doc, entity]
+    range: [literal]
+    requires_evidence: false
+    description: The subject's current version identifier.
+    legacy: {array: FUNCTIONAL, prefix: version}
+
+  value_of:
+    cardinality: single
+    domain: [any]
+    range: [literal]
+    requires_evidence: false
+    description: The value currently held by the subject.
+    legacy: {array: FUNCTIONAL, prefix: value_of}
+
+  current_value:
+    cardinality: single
+    domain: [any]
+    range: [literal]
+    requires_evidence: false
+    description: Synonym of value_of, retained because the prefix table shipped both.
+    legacy: {array: FUNCTIONAL, prefix: current_value}
+
+  email:
+    cardinality: single
+    domain: [entity, any]
+    range: [literal]
+    requires_evidence: false
+    description: Current email address of the subject.
+    legacy: {array: FUNCTIONAL, prefix: email}
+
+  phone:
+    cardinality: single
+    domain: [entity, any]
+    range: [literal]
+    requires_evidence: false
+    description: Current phone number of the subject.
+    legacy: {array: FUNCTIONAL, prefix: phone}
+
+  address:
+    cardinality: single
+    domain: [entity, any]
+    range: [literal]
+    requires_evidence: false
+    description: Current postal address of the subject.
+    legacy: {array: FUNCTIONAL, prefix: address}
+
+  works_at:
+    cardinality: single
+    domain: [entity, any]
+    range: [entity, any]
+    requires_evidence: false
+    description: Current employer of the subject.
+    legacy:
+      array: none
+      note: >-
+        not in either prefix array — it is the sole entry of the
+        `exclusive("works_at")` Datalog table in DEFAULT_RULES, the second
+        mechanism this file subsumes.

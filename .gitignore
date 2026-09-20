@@ -18,3 +18,4 @@ lme-ctx/
 
 # per-snapshot embedding caches (benchmark iteration)
 *.snap.embed.json
+tmp/

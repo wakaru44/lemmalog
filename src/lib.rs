@@ -35,9 +35,12 @@ pub mod llm;
 #[cfg(feature = "llm")]
 pub mod longmemeval;
 pub mod magic;
+pub mod ontology;
 pub mod retrieval;
 pub mod scenario;
 pub mod semantics;
+#[cfg(feature = "sqlite")]
+pub mod storage;
 pub mod session;
 
 pub use agent::{
