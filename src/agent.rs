@@ -551,9 +551,36 @@ impl<X: Extractor> AgentMemory<X> {
             for old in &open {
                 let mut closed = old.clone();
                 closed[4] = Value::Int(self.engine.now);
+                // Carry the original annotation onto the closed row. Rebuilding
+                // it as `Ann::base(0.9, ["superseded"])` keeps the history row
+                // but discards who asserted it and how sure they were, which is
+                // most of why the history is worth keeping: a closed edge can no
+                // longer answer "who said this, and on what evidence?".
+                // Confidence is preserved verbatim -- closing an edge in valid
+                // time says the world moved on, not that the observation was
+                // ever less certain. The marker is added to the provenance set,
+                // not substituted for it.
+                //
+                // Linear scan: `Relation::by_key` is private to `eval`, and
+                // ADR 1 keeps this fork out of `eval.rs`. Supersession only
+                // fires for exclusive, non-multi relations, so this is rare;
+                // if it ever shows up in a profile, the fix is an accessor
+                // upstream, not a wider diff here.
+                let prior = self
+                    .engine
+                    .relations
+                    .get("edge")
+                    .and_then(|r| r.rows.iter().find(|row| row.key == *old))
+                    .map(|row| row.fact.ann.clone());
+                let ann = match prior {
+                    Some(mut a) => {
+                        a.prov.insert("superseded".to_string());
+                        a
+                    }
+                    None => Ann::base(0.9, ["superseded"]),
+                };
                 self.engine.retract("edge", old);
-                self.engine
-                    .declare("edge", &closed, Ann::base(0.9, ["superseded"]));
+                self.engine.declare("edge", &closed, ann);
             }
             self.assert_open(&[subj, pred, obj], c.confidence, &ep.id);
             report.updated += 1;
