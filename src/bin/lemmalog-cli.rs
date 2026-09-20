@@ -32,14 +32,43 @@ fn snap_path() -> String {
     })
 }
 
+/// Wall-clock seconds since the Unix epoch.
+fn wall_clock() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Advance the engine clock to the present and re-derive temporal views.
+///
+/// `current/3` guards on `VF =< T < VT`, so a memory loaded at the
+/// snapshot's stored `NOW` answers every read at that past instant: a
+/// fact asserted later fails the `VF =< T` test and is invisible to
+/// `current`, though it is still there in `edge`. Reads sync forward;
+/// ingest keeps honouring its own `--ts` as valid-time. The clock only
+/// ever moves forward — a backdated fact must not drag the present
+/// backwards.
+fn sync_clock(m: &mut AgentMemory<MockExtractor>) {
+    let t = wall_clock();
+    let e = &mut m.engine;
+    if t > e.now {
+        e.set_now(t);
+        e.invalidate_derived();
+        let _ = e.run();
+    }
+}
+
 fn load(path: &str) -> AgentMemory<MockExtractor> {
-    match AgentMemory::load(MockExtractor::new(0.9), path) {
+    let mut m = match AgentMemory::load(MockExtractor::new(0.9), path) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("lemmalog-cli: snapshot load failed ({e}); starting fresh");
             AgentMemory::new(MockExtractor::new(0.9), "").expect("fresh memory")
         }
-    }
+    };
+    sync_clock(&mut m);
+    m
 }
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -65,8 +94,11 @@ fn main() {
             let mut m = load(&snap_path());
             let text = stdin_or_flag(&args, "--facts");
             let ts = flag(&args, "--ts").and_then(|t| t.parse::<i64>().ok());
-            let ts = ts.unwrap_or(m.engine.now);
+            let ts = ts.unwrap_or_else(wall_clock);
             let (report, dropped) = m.observe_extracted(&text, ts);
+            // observe_extracted sets the clock to `ts`, so an explicit
+            // backdated --ts would otherwise persist a past NOW.
+            sync_clock(&mut m);
             let _ = m.maintain(m.engine.now);
             m.save(&snap_path()).expect("save snapshot");
             println!(
