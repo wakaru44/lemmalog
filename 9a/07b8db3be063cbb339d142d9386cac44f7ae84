@@ -1,0 +1,19 @@
+backlog/incoming/ontology-set-but-missing-is-silent.md
+  s_a730f5d714a5fb::t_7be7fa14d2d1b3 1-84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9a07b8db3be063cbb339d142d9386cac44f7ae84",
+  "prompts": {},
+  "sessions": {
+    "s_a730f5d714a5fb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "11f84a13-2ba4-4a99-9dbe-42a33cb2a9e2",
+        "model": "unknown"
+      },
+      "human_author": "Wakaru Himura <wakaru44@gmail.com>"
+    }
+  }
+}
