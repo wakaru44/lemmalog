@@ -991,6 +991,10 @@ impl<A: Annotation> Engine<A> {
             .iter()
             .any(|c| !c.is_fact && c.body.iter().any(|l| matches!(l, Lit::Neg(_))));
         let mut guard = 0;
+        // Readers cleared by an earlier pass of this run. Their inputs do not change
+        // within the run (grew is fixed; only retractions change inputs, and the
+        // retracted check handles those), so clearing them again rebuilds the same rows.
+        let mut already_cleared: BTreeSet<String> = BTreeSet::new();
         loop {
             guard += 1;
             if guard > strata.len() + 2 {
@@ -1019,9 +1023,11 @@ impl<A: Annotation> Engine<A> {
                     }
                 }
             }
+            extra_clear.retain(|p| !already_cleared.contains(p));
             if self.retracted.is_empty() && extra_clear.is_empty() {
                 break;
             }
+            already_cleared.extend(extra_clear.iter().cloned());
             let (_, d) = self.scoped_recompute(&strata, extra_clear);
             derived += d;
         }
